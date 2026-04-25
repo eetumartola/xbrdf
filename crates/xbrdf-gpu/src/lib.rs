@@ -52,8 +52,11 @@ struct GpuParams {
     max_repeat_radius: u32,
     y_offset: u32,
     active_height: u32,
+    sample_offset: u32,
+    target_samples: u32,
     tile_min: [f32; 2],
     tile_size: [f32; 2],
+    _pad0: [u32; 2],
     bounds_min: [f32; 4],
     bounds_max: [f32; 4],
     light_dir: [f32; 4],
@@ -77,6 +80,25 @@ pub struct GpuBakeResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProgressChunk {
+    pub y_offset: u32,
+    pub height: u32,
+    pub width: u32,
+    pub completed_rows: u32,
+    pub total_rows: u32,
+    pub pixels: Vec<[f32; 3]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgressiveFrame {
+    pub completed_samples: u32,
+    pub total_samples: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<[f32; 3]>,
+}
+
+#[derive(Debug, Clone)]
 pub struct GpuBakeStats {
     pub triangle_count: usize,
     pub bvh_node_count: usize,
@@ -95,7 +117,320 @@ pub struct GpuBakeStats {
     pub readback_time: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressiveBakeOptions {
+    pub update_interval: Duration,
+}
+
+impl Default for ProgressiveBakeOptions {
+    fn default() -> Self {
+        Self {
+            update_interval: Duration::from_millis(500),
+        }
+    }
+}
+
 pub async fn bake(config: &ResolvedBakeConfig, mesh: &Mesh) -> Result<GpuBakeResult, GpuBakeError> {
+    bake_inner(config, mesh, None).await
+}
+
+pub async fn bake_progressive<F>(
+    config: &ResolvedBakeConfig,
+    mesh: &Mesh,
+    options: ProgressiveBakeOptions,
+    mut progress: F,
+) -> Result<GpuBakeResult, GpuBakeError>
+where
+    F: FnMut(ProgressiveFrame),
+{
+    bake_progressive_inner(config, mesh, options, &mut progress).await
+}
+
+pub async fn bake_with_progress<F>(
+    config: &ResolvedBakeConfig,
+    mesh: &Mesh,
+    mut progress: F,
+) -> Result<GpuBakeResult, GpuBakeError>
+where
+    F: FnMut(ProgressChunk),
+{
+    bake_inner(config, mesh, Some(&mut progress)).await
+}
+
+async fn bake_progressive_inner(
+    config: &ResolvedBakeConfig,
+    mesh: &Mesh,
+    options: ProgressiveBakeOptions,
+    progress: &mut dyn FnMut(ProgressiveFrame),
+) -> Result<GpuBakeResult, GpuBakeError> {
+    let total_start = Instant::now();
+    let (triangles, bvh_nodes) = build_bvh(&mesh.triangles);
+    let bvh_build_time = total_start.elapsed();
+
+    let gpu_setup_start = Instant::now();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok_or(GpuBakeError::NoAdapter)?;
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("xbrdf progressive device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        )
+        .await?;
+
+    let light = Vec3::from_array(config.light);
+    let base_params = GpuParams {
+        width: config.width,
+        height: config.height,
+        samples: config.samples,
+        triangle_count: triangles.len() as u32,
+        node_count: bvh_nodes.len() as u32,
+        max_repeat_radius: config.max_repeat_radius,
+        y_offset: 0,
+        active_height: config.height,
+        sample_offset: 0,
+        target_samples: config.samples,
+        tile_min: [mesh.tile_min_x, mesh.tile_min_z],
+        tile_size: [mesh.tile_width, mesh.tile_depth],
+        _pad0: [0; 2],
+        bounds_min: vec4(mesh.bounds.min),
+        bounds_max: vec4(mesh.bounds.max),
+        light_dir: vec4(light),
+        material_color: [
+            config.material.color[0],
+            config.material.color[1],
+            config.material.color[2],
+            0.0,
+        ],
+        material_kind: [
+            match config.material.kind {
+                MaterialKind::Lambertian => 0,
+                MaterialKind::SpecularPhong => 1,
+            },
+            0,
+            0,
+            0,
+        ],
+        material_params: [
+            1.0 / light.y.max(1.0e-4),
+            ((mesh.bounds.max.y - mesh.bounds.min.y).abs() * 0.01).max(1.0e-3),
+            config.material.roughness.unwrap_or(0.0),
+            config.material.phong_exponent().unwrap_or(1.0),
+        ],
+    };
+
+    let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("xbrdf progressive triangles"),
+        contents: bytemuck::cast_slice(&triangles),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("xbrdf progressive bvh"),
+        contents: bytemuck::cast_slice(&bvh_nodes),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("xbrdf progressive params"),
+        contents: bytemuck::bytes_of(&base_params),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let pixel_count = config.width as u64 * config.height as u64;
+    let output_size = pixel_count * std::mem::size_of::<[f32; 4]>() as u64;
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("xbrdf progressive output"),
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("xbrdf progressive bake shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("xbrdf progressive bind group layout"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            storage_entry(3, false),
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("xbrdf progressive pipeline layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("xbrdf progressive bake pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: "main",
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("xbrdf progressive bind group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: triangle_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: bvh_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: output_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let gpu_setup_time = gpu_setup_start.elapsed();
+
+    let rows_per_dispatch = rows_per_dispatch(config);
+    let mut completed_samples = 0u32;
+    let mut batch_samples = 1u32;
+    let mut dispatch_count = 0u32;
+    let mut readback_time = Duration::ZERO;
+    let mut accumulated = vec![[0.0; 3]; pixel_count as usize];
+    let mut averaged = vec![[0.0; 3]; pixel_count as usize];
+    let dispatch_start = Instant::now();
+    let target_interval = options.update_interval.max(Duration::from_millis(1));
+
+    while completed_samples < config.samples {
+        let remaining = config.samples - completed_samples;
+        let active_batch = batch_samples.min(remaining).max(1);
+        let batch_start = Instant::now();
+        let mut y_offset = 0;
+        while y_offset < config.height {
+            let active_height = rows_per_dispatch.min(config.height - y_offset);
+            let params = GpuParams {
+                samples: active_batch,
+                sample_offset: completed_samples,
+                target_samples: config.samples,
+                y_offset,
+                active_height,
+                ..base_params
+            };
+            queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("xbrdf progressive bake encoder"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("xbrdf progressive bake pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(config.width.div_ceil(8), active_height.div_ceil(8), 1);
+            }
+            queue.submit(Some(encoder.finish()));
+            device.poll(wgpu::Maintain::Wait);
+            y_offset += active_height;
+            dispatch_count += 1;
+        }
+
+        let readback_start = Instant::now();
+        let batch_pixels = read_output_rows(
+            &device,
+            &queue,
+            &output_buffer,
+            config.width,
+            0,
+            config.height,
+        )?;
+        readback_time += readback_start.elapsed();
+        completed_samples += active_batch;
+
+        for ((sum, avg), batch) in accumulated
+            .iter_mut()
+            .zip(averaged.iter_mut())
+            .zip(batch_pixels.iter())
+        {
+            sum[0] += batch[0] * active_batch as f32;
+            sum[1] += batch[1] * active_batch as f32;
+            sum[2] += batch[2] * active_batch as f32;
+            avg[0] = sum[0] / completed_samples as f32;
+            avg[1] = sum[1] / completed_samples as f32;
+            avg[2] = sum[2] / completed_samples as f32;
+        }
+
+        progress(ProgressiveFrame {
+            completed_samples,
+            total_samples: config.samples,
+            width: config.width,
+            height: config.height,
+            pixels: averaged.clone(),
+        });
+
+        let elapsed = batch_start.elapsed();
+        if elapsed < target_interval / 2 && active_batch < remaining {
+            batch_samples = (batch_samples.saturating_mul(2)).max(1);
+        } else if elapsed > target_interval.saturating_mul(2) && batch_samples > 1 {
+            batch_samples = (batch_samples / 2).max(1);
+        }
+    }
+    let gpu_dispatch_time = dispatch_start.elapsed().saturating_sub(readback_time);
+
+    let max_periodic_copies_per_axis = config.max_repeat_radius as u64 * 2 + 1;
+    let max_periodic_copies_per_ray = max_periodic_copies_per_axis * max_periodic_copies_per_axis;
+    let camera_ray_count = config.width as u64 * config.height as u64 * config.samples as u64;
+
+    Ok(GpuBakeResult {
+        pixels: averaged,
+        stats: GpuBakeStats {
+            triangle_count: triangles.len(),
+            bvh_node_count: bvh_nodes.len(),
+            width: config.width,
+            height: config.height,
+            samples: config.samples,
+            max_repeat_radius: config.max_repeat_radius,
+            rows_per_dispatch,
+            dispatch_count,
+            camera_ray_count,
+            max_periodic_copies_per_ray,
+            max_bvh_traces: camera_ray_count * max_periodic_copies_per_ray * 2,
+            bvh_build_time,
+            gpu_setup_time,
+            gpu_dispatch_time,
+            readback_time,
+        },
+    })
+}
+
+async fn bake_inner(
+    config: &ResolvedBakeConfig,
+    mesh: &Mesh,
+    mut progress: Option<&mut dyn FnMut(ProgressChunk)>,
+) -> Result<GpuBakeResult, GpuBakeError> {
     let total_start = Instant::now();
     let (triangles, bvh_nodes) = build_bvh(&mesh.triangles);
     let bvh_build_time = total_start.elapsed();
@@ -132,8 +467,11 @@ pub async fn bake(config: &ResolvedBakeConfig, mesh: &Mesh) -> Result<GpuBakeRes
         max_repeat_radius: config.max_repeat_radius,
         y_offset: 0,
         active_height: config.height,
+        sample_offset: 0,
+        target_samples: config.samples,
         tile_min: [mesh.tile_min_x, mesh.tile_min_z],
         tile_size: [mesh.tile_width, mesh.tile_depth],
+        _pad0: [0; 2],
         bounds_min: vec4(mesh.bounds.min),
         bounds_max: vec4(mesh.bounds.max),
         light_dir: vec4(light),
@@ -282,6 +620,26 @@ pub async fn bake(config: &ResolvedBakeConfig, mesh: &Mesh) -> Result<GpuBakeRes
         }
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::Maintain::Wait);
+
+        if let Some(progress) = progress.as_deref_mut() {
+            let chunk_pixels = read_output_rows(
+                &device,
+                &queue,
+                &output_buffer,
+                config.width,
+                y_offset,
+                active_height,
+            )?;
+            progress(ProgressChunk {
+                y_offset,
+                height: active_height,
+                width: config.width,
+                completed_rows: y_offset + active_height,
+                total_rows: config.height,
+                pixels: chunk_pixels,
+            });
+        }
+
         y_offset += active_height;
         dispatch_count += 1;
     }
@@ -340,6 +698,54 @@ pub async fn bake(config: &ResolvedBakeConfig, mesh: &Mesh) -> Result<GpuBakeRes
             readback_time,
         },
     })
+}
+
+fn read_output_rows(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    output_buffer: &wgpu::Buffer,
+    width: u32,
+    y_offset: u32,
+    height: u32,
+) -> Result<Vec<[f32; 3]>, GpuBakeError> {
+    let pixel_size = std::mem::size_of::<[f32; 4]>() as u64;
+    let row_offset = y_offset as u64 * width as u64 * pixel_size;
+    let chunk_size = height as u64 * width as u64 * pixel_size;
+    let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("xbrdf progress readback"),
+        size: chunk_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("xbrdf progress readback encoder"),
+    });
+    encoder.copy_buffer_to_buffer(output_buffer, row_offset, &readback_buffer, 0, chunk_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = readback_buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::Maintain::Wait);
+
+    receiver
+        .recv()
+        .map_err(|_| GpuBakeError::MapChannelClosed)?
+        .map_err(|_| GpuBakeError::BufferMapFailed)?;
+
+    let mapped = slice.get_mapped_range();
+    let rgba: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
+    let rgb = rgba
+        .iter()
+        .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect();
+    drop(mapped);
+    readback_buffer.unmap();
+
+    Ok(rgb)
 }
 
 fn build_bvh(source: &[Triangle]) -> (Vec<GpuTriangle>, Vec<GpuBvhNode>) {

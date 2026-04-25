@@ -1,3 +1,4 @@
 [alias]
 bake = "run --"
 bake-release = "run --release --"
+gui = "run -p xbrdf-gui --"

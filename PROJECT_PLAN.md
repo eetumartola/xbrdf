@@ -27,7 +27,7 @@ Build xBRDF as a Rust GPU baker plus later preview/shader tooling. The MVP is a 
 - [ ] Post-MVP: add light-direction sweep producing one pano per light direction.
 - [ ] Post-MVP: add interpolation metadata and lookup conventions for shader consumption.
 - [x] Post-MVP: add BVH acceleration.
-- [ ] Post-MVP: add Dear ImGui preview and bake-control app.
+- [x] Post-MVP: add Dear ImGui preview and bake-control app.
 - [ ] Post-MVP: prototype Houdini shader/import workflow.
 
 ## Decisions
@@ -49,6 +49,8 @@ Build xBRDF as a Rust GPU baker plus later preview/shader tooling. The MVP is a 
 - 2026-04-25: Define each pixel's camera-ray footprint as the full periodic XZ tile. Individual rays are point samples of that footprint, using per-pixel low-discrepancy tile samples to reduce coherent point/grid artifacts.
 - 2026-04-25: Keep shading faceted by using per-triangle geometric normals only. OBJ vertex normals and smoothing groups are ignored because the explicit microgeometry should define the BRDF response.
 - 2026-04-25: Simplify local CLI use with `default-members`, optional `bake` subcommand syntax, and a `cargo bake` alias. Preferred repo-root command is now `cargo bake --config ... --out ...`.
+- 2026-04-25: Add the Dear ImGui bake-control app as a separate `xbrdf-gui` crate using a Glium ImGui renderer. The bake path remains `wgpu`; the GUI only owns controls, the preview texture, and the event loop.
+- 2026-04-25: Add a progress-capable GPU bake entry point that reads back completed row chunks. This is slower than the CLI's final-only readback, but it lets long renders show real viewport progress.
 
 ## Verification Log
 
@@ -65,6 +67,9 @@ Build xBRDF as a Rust GPU baker plus later preview/shader tooling. The MVP is a 
 - 2026-04-25: Added `assets/fixtures/colors.obj` and `colors.toml` as a small vertex-color bake fixture.
 - 2026-04-25: `cargo test --workspace` passed with 12 unit tests. `cargo bake --config assets/fixtures/colors.toml --out out/colors` passed and reported `colors: obj_vertex_color`. Current large specular fixture also baked with the color-capable triangle format.
 - 2026-04-25: Tuned GPU BVH traversal for large meshes. Shadow rays now use an any-hit early-out traversal, and camera closest-hit traversal visits nearer child AABBs first. On the 129032-triangle FBX fixture at 128x64, 1200 samples, release GPU dispatch improved from about 12.8s / 0.77M camera rays/s to about 8.5s / 1.16M camera rays/s. A tested 8-triangle leaf size and near-sorted shadow traversal were slower, so the leaf size remains 4 and shadow traversal stays unsorted.
+- 2026-04-25: Added `xbrdf-gui` with ImGui controls for config/source/output paths, resolution, samples, repeat radius, light, tile overrides, material, color, and roughness. `cargo test --workspace -j 1` passed with 12 unit tests and the default-ignored GPU smoke test; `cargo test -p xbrdf-cli --test smoke_bake -- --ignored` also passed explicitly.
+- 2026-04-25: Fixed GUI startup/config ergonomics. The app now initializes controls from the default config path, preserves viewport aspect ratio when fitting to panel height, and resolves editable geometry-path overrides from the working directory so loaded config-relative paths are not joined twice.
+- 2026-04-25: Replaced GUI row-progress preview with progressive full-frame sample integration. The GUI now accumulates whole-image sample batches, updates at a configurable interval, and reports completed samples against the target sample count. `cargo test --workspace -j 1` and the explicit GPU smoke test passed.
 
 ## Acceptance Criteria
 

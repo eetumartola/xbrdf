@@ -1,6 +1,6 @@
 # xBRDF
 
-xBRDF is an explicit BRDF baker for microgeometry tiles. The MVP loads an OBJ tile, treats X/Z as a periodic domain with Y up, renders one upper-hemisphere latlong response for a fixed directional light, and writes OpenEXR data plus a reproducibility manifest.
+xBRDF is an explicit BRDF baker for microgeometry tiles. The current baker loads OBJ or binary FBX tiles, treats X/Z as a periodic domain with Y up, renders one upper-hemisphere latlong response for a fixed directional light, and writes OpenEXR data plus a reproducibility manifest.
 
 ## Build
 
@@ -35,6 +35,16 @@ The bake writes:
 - `manifest.toml`: resolved bake settings and conventions.
 
 After each bake, the CLI prints basic timing and workload stats: geometry size, BVH node count, image size, samples, periodic repeat cap, dispatch chunks, estimated ray work, and phase timings.
+
+## GUI
+
+Launch the Dear ImGui bake-control app from the repo root:
+
+```powershell
+cargo gui
+```
+
+The GUI exposes the same basic bake settings as the CLI: config path, source geometry, output folder, resolution, samples, repeat radius, light, tile overrides, material, color, and roughness. Bakes run on a background thread and the viewport progressively updates the full image as new sample batches are integrated. The update interval is configurable in seconds, and the progress bar shows completed samples against the target sample count. The GUI still writes `xbrdf_view.exr` and `manifest.toml` to the selected output folder.
 
 `width` and `height` are the output pano resolution. They are not read from the source mesh. OBJ/FBX files are used for triangle geometry and, unless overridden by `tile_width` / `tile_depth`, the periodic XZ tile bounds.
 
@@ -85,4 +95,4 @@ roughness = 0.02
 - White Lambertian and normalized Phong specular materials.
 - Direct lighting and visibility only.
 - GPU BVH triangle intersection with chunked row dispatches.
-- OBJ materials, textures, multiple scattering, GUI preview, and Houdini shader lookup are post-MVP work.
+- Texture maps, multiple scattering, multi-light BRDF sweeps, and Houdini shader lookup are post-MVP work.

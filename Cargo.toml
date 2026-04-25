@@ -2,6 +2,7 @@
 members = [
     "crates/xbrdf-cli",
     "crates/xbrdf-core",
+    "crates/xbrdf-gui",
     "crates/xbrdf-gpu",
 ]
 default-members = ["crates/xbrdf-cli"]
@@ -18,7 +19,14 @@ bytemuck = { version = "1.15", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 exr = "1.72"
 fbx = "0.2.0"
+glium = "0.34.0"
+glutin = "0.31.1"
+glutin-winit = "0.4.2"
+imgui = "0.12.0"
+imgui-glium-renderer = "0.12.0"
+imgui-winit-support = "0.12.0"
 pollster = "0.3"
+raw-window-handle = "0.5.0"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.10"
 thiserror = "1.0"

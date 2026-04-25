@@ -3,7 +3,7 @@ obj = "groovenoise_rg.fbx"
 # Higher resolution helps catch the narrow specular lobe.
 width = 128
 height = 64
-samples = 1200
+samples = 640
 light = [0.0, 1.0, -1.0]
 max_repeat_radius = 2
 

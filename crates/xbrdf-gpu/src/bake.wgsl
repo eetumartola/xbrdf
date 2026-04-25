@@ -32,6 +32,8 @@ struct Params {
     max_repeat_radius: u32,
     y_offset: u32,
     active_height: u32,
+    sample_offset: u32,
+    target_samples: u32,
     tile_min: vec2<f32>,
     tile_size: vec2<f32>,
     bounds_min: vec4<f32>,
@@ -93,14 +95,15 @@ fn radical_inverse_vdc(bits_in: u32) -> f32 {
 }
 
 fn sample_2d(sample_index: u32, pixel_x: u32, pixel_y: u32) -> vec2<f32> {
-    let pixel_seed = pixel_x * 1973u + pixel_y * 9277u + params.samples * 26699u;
+    let global_sample = params.sample_offset + sample_index;
+    let pixel_seed = pixel_x * 1973u + pixel_y * 9277u + params.target_samples * 26699u;
     let rotation = vec2<f32>(
         hash_float(pixel_seed),
         hash_float(pixel_seed ^ 0x9e3779b9u)
     );
     let base = vec2<f32>(
-        (f32(sample_index) + 0.5) / f32(params.samples),
-        radical_inverse_vdc(sample_index)
+        (f32(global_sample) + 0.5) / f32(params.target_samples),
+        radical_inverse_vdc(global_sample)
     );
     return fract(base + rotation);
 }
