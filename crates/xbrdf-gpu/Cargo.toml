@@ -1,0 +1,11 @@
+[package]
+name = "xbrdf-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+xbrdf-core.workspace = true

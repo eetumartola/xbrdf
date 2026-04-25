@@ -1,0 +1,11 @@
+obj = "colors.obj"
+
+width = 32
+height = 16
+samples = 16
+light = [0.0, 1.0, -1.0]
+max_repeat_radius = 2
+
+[material]
+kind = "lambertian"
+color = [1.0, 1.0, 1.0]

@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/xbrdf-cli",
+    "crates/xbrdf-core",
+    "crates/xbrdf-gpu",
+]
+default-members = ["crates/xbrdf-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.15", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+exr = "1.72"
+fbx = "0.2.0"
+pollster = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.10"
+thiserror = "1.0"
+tobj = "4.0"
+toml = "0.8"
+wgpu = "0.20"
+xbrdf-core = { path = "crates/xbrdf-core" }
+xbrdf-gpu = { path = "crates/xbrdf-gpu" }

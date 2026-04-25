@@ -1,0 +1,3 @@
+[alias]
+bake = "run --"
+bake-release = "run --release --"
