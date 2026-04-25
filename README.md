@@ -34,7 +34,7 @@ The bake writes:
 - `xbrdf_view.exr`: RGB float hemisphere latlong response.
 - `manifest.toml`: resolved bake settings and conventions.
 
-After each bake, the CLI prints basic timing and workload stats: geometry size, BVH node count, image size, samples, periodic repeat cap, dispatch chunks, estimated ray work, and phase timings.
+After each bake, the CLI prints basic timing and workload stats: geometry size, BVH node count, image size, samples, periodic repeat cap, dispatch chunks, estimated ray work, and phase timings. GPU work is chunked by a trace budget rounded up to full 8-row compute workgroups, so high-sample renders avoid one-row dispatch underutilization while still splitting very large bakes.
 
 ## GUI
 
@@ -44,7 +44,7 @@ Launch the Dear ImGui bake-control app from the repo root:
 cargo gui
 ```
 
-The GUI exposes the same basic bake settings as the CLI: config path, source geometry, output folder, resolution, samples, repeat radius, light, tile overrides, material, color, and roughness. Bakes run on a background thread and the viewport progressively updates the full image as new sample batches are integrated. The update interval is configurable in seconds, and the progress bar shows completed samples against the target sample count. The GUI still writes `xbrdf_view.exr` and `manifest.toml` to the selected output folder.
+The GUI exposes the same basic bake settings as the CLI: config path, source geometry, output folder, resolution, samples, repeat radius, light, tile overrides, material, color, and roughness. Bakes run on a background thread and the viewport progressively updates the full image as new sample batches are integrated. The update interval is configurable in seconds, and the progress bar shows completed samples against the target sample count. Finished renders are retained in session history; use the ticked slider under the viewport to scrub back through completed bakes. The GUI still writes `xbrdf_view.exr` and `manifest.toml` to the selected output folder.
 
 `width` and `height` are the output pano resolution. They are not read from the source mesh. OBJ/FBX files are used for triangle geometry and, unless overridden by `tile_width` / `tile_depth`, the periodic XZ tile bounds.
 

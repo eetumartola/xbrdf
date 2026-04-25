@@ -162,6 +162,9 @@ struct AppState {
     preview: PreviewImage,
     preview_dirty: bool,
     last_stats: Option<GpuBakeStats>,
+    history: Vec<RenderSnapshot>,
+    history_index: i32,
+    follow_latest: bool,
 }
 
 impl Default for AppState {
@@ -177,6 +180,9 @@ impl Default for AppState {
             preview: PreviewImage::default(),
             preview_dirty: false,
             last_stats: None,
+            history: Vec::new(),
+            history_index: -1,
+            follow_latest: true,
         }
     }
 }
@@ -205,8 +211,7 @@ impl AppState {
         self.total_samples = 0;
         self.last_stats = None;
         self.status = "Starting bake".to_string();
-        self.preview = PreviewImage::default();
-        self.preview_dirty = true;
+        self.follow_latest = true;
 
         std::thread::spawn(move || {
             let result = run_bake(settings, |event| {
@@ -236,8 +241,11 @@ impl AppState {
                     self.status = "Baking".to_string();
                 }
                 BakeEvent::Frame(frame) => {
-                    self.preview.write_frame(&frame);
-                    self.preview_dirty = true;
+                    let image = PreviewImage::from_frame(&frame);
+                    if self.follow_latest || self.history.is_empty() {
+                        self.preview = image;
+                        self.preview_dirty = true;
+                    }
                     self.completed_samples = frame.completed_samples;
                     self.total_samples = frame.total_samples;
                     self.progress = if frame.total_samples > 0 {
@@ -260,6 +268,11 @@ impl AppState {
                     self.progress = 1.0;
                     self.completed_samples = self.total_samples;
                     self.last_stats = Some(stats);
+                    let label = format!("{} samples", self.total_samples);
+                    self.push_history(RenderSnapshot {
+                        image: self.preview.clone(),
+                        label,
+                    });
                     self.status = format!("Wrote {} and {}", image.display(), manifest.display());
                 }
                 BakeEvent::Error(error) => {
@@ -273,6 +286,28 @@ impl AppState {
         if keep_receiver {
             self.receiver = Some(receiver);
         }
+    }
+
+    fn push_history(&mut self, snapshot: RenderSnapshot) {
+        self.history.push(snapshot);
+        if self.follow_latest || self.history_index < 0 {
+            self.history_index = self.history.len() as i32 - 1;
+            self.preview = self.history[self.history_index as usize].image.clone();
+            self.preview_dirty = true;
+        }
+    }
+
+    fn select_history(&mut self, index: i32) {
+        if self.history.is_empty() {
+            self.history_index = -1;
+            return;
+        }
+
+        let index = index.clamp(0, self.history.len() as i32 - 1);
+        self.history_index = index;
+        self.follow_latest = index == self.history.len() as i32 - 1;
+        self.preview = self.history[index as usize].image.clone();
+        self.preview_dirty = true;
     }
 }
 
@@ -291,7 +326,12 @@ enum BakeEvent {
     Error(String),
 }
 
-#[derive(Default)]
+struct RenderSnapshot {
+    image: PreviewImage,
+    label: String,
+}
+
+#[derive(Clone, Default)]
 struct PreviewImage {
     width: u32,
     height: u32,
@@ -307,6 +347,12 @@ impl PreviewImage {
             rgba: vec![0; width as usize * height as usize * 4],
             exposure: 0.0,
         }
+    }
+
+    fn from_frame(frame: &ProgressiveFrame) -> Self {
+        let mut image = Self::new(frame.width, frame.height);
+        image.write_frame(frame);
+        image
     }
 
     fn write_frame(&mut self, frame: &ProgressiveFrame) {
@@ -445,6 +491,13 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
                     rays_per_second(stats)
                 ));
             }
+            if ui.button("Clear History") {
+                app.history.clear();
+                app.history_index = -1;
+                app.follow_latest = true;
+                app.preview = PreviewImage::default();
+                app.preview_dirty = true;
+            }
         });
 
     ui.window("Viewport")
@@ -463,10 +516,86 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
                     width = height * image_aspect;
                 }
                 Image::new(id, [width, height]).build(ui);
+                draw_history_controls(ui, app, width);
             } else {
                 ui.text("No preview yet");
             }
         });
+}
+
+fn draw_history_controls(ui: &Ui, app: &mut AppState, width: f32) {
+    if app.history.is_empty() {
+        return;
+    }
+
+    let max_index = app.history.len() as i32 - 1;
+    let mut index = app.history_index.clamp(0, max_index);
+    ui.set_next_item_width(width);
+    let changed = ui
+        .slider_config("##render_history", 0, max_index)
+        .display_format("")
+        .build(&mut index);
+    let slider_min = ui.item_rect_min();
+    let slider_max = ui.item_rect_max();
+    draw_history_ticks(
+        ui,
+        slider_min,
+        slider_max,
+        app.history.len(),
+        index as usize,
+    );
+    ui.dummy([0.0, 9.0]);
+
+    if changed {
+        app.select_history(index);
+    }
+
+    let label = &app.history[app.history_index.max(0) as usize].label;
+    ui.text(format!(
+        "Render {} / {} - {}",
+        app.history_index + 1,
+        app.history.len(),
+        label
+    ));
+}
+
+fn draw_history_ticks(
+    ui: &Ui,
+    slider_min: [f32; 2],
+    slider_max: [f32; 2],
+    count: usize,
+    selected: usize,
+) {
+    if count == 0 {
+        return;
+    }
+
+    let draw_list = ui.get_window_draw_list();
+    let usable_width = (slider_max[0] - slider_min[0]).max(1.0);
+    let y0 = slider_max[1] + 2.0;
+    let max_ticks = 96usize;
+    let step = ((count + max_ticks - 1) / max_ticks).max(1);
+
+    for index in (0..count).step_by(step) {
+        let t = if count > 1 {
+            index as f32 / (count - 1) as f32
+        } else {
+            0.0
+        };
+        let x = slider_min[0] + t * usable_width;
+        draw_list
+            .add_line([x, y0], [x, y0 + 5.0], [0.45, 0.45, 0.48, 1.0])
+            .build();
+    }
+
+    if count > 1 {
+        let t = selected as f32 / (count - 1) as f32;
+        let x = slider_min[0] + t * usable_width;
+        draw_list
+            .add_line([x, y0], [x, y0 + 8.0], [0.95, 0.95, 0.85, 1.0])
+            .thickness(2.0)
+            .build();
+    }
 }
 
 fn run_bake<F>(settings: BakeSettings, mut send: F) -> Result<()>

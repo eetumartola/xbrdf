@@ -122,6 +122,20 @@ fn repeat_radius(direction: vec3<f32>, axis: u32) -> i32 {
     return min(repeat, i32(params.max_repeat_radius));
 }
 
+fn shadow_repeat_radius(direction: vec3<f32>, axis: u32) -> i32 {
+    let margin = params.material_params.y;
+    let height = max(params.bounds_max.y - params.bounds_min.y + 2.0 * margin, margin);
+    let dy = max(abs(direction.y), EPSILON);
+    var tile_size = params.tile_size.x;
+    var lateral = abs(direction.x);
+    if (axis == 1u) {
+        tile_size = params.tile_size.y;
+        lateral = abs(direction.z);
+    }
+    let repeat = i32(ceil((lateral / dy) * height / tile_size));
+    return min(repeat, i32(params.max_repeat_radius));
+}
+
 fn intersect_aabb_t(origin: vec3<f32>, inv_direction: vec3<f32>, bounds_min: vec3<f32>, bounds_max: vec3<f32>, max_t: f32) -> f32 {
     let tx1 = (bounds_min.x - origin.x) * inv_direction.x;
     let tx2 = (bounds_max.x - origin.x) * inv_direction.x;
@@ -307,8 +321,8 @@ fn trace_periodic(origin: vec3<f32>, direction: vec3<f32>) -> Hit {
 }
 
 fn any_shadow_hit(origin: vec3<f32>, direction: vec3<f32>) -> bool {
-    let rx = repeat_radius(direction, 0u);
-    let rz = repeat_radius(direction, 1u);
+    let rx = shadow_repeat_radius(direction, 0u);
+    let rz = shadow_repeat_radius(direction, 1u);
 
     for (var oz = -rz; oz <= rz; oz = oz + 1) {
         for (var ox = -rx; ox <= rx; ox = ox + 1) {
@@ -379,11 +393,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (hit.found) {
             let n = hit.normal;
             if (dot(n, wo) > 0.0) {
-                let n_dot_l = max(dot(n, params.light_dir.xyz), 0.0);
-                if (n_dot_l > 0.0) {
+                let contribution = hit.color * evaluate_material(n, params.light_dir.xyz, wo);
+                if (any(contribution > vec3<f32>(0.0))) {
                     let shadow_origin = hit.position + params.light_dir.xyz * HIT_EPSILON * 4.0;
                     if (!any_shadow_hit(shadow_origin, params.light_dir.xyz)) {
-                        sum = sum + hit.color * evaluate_material(n, params.light_dir.xyz, wo);
+                        sum = sum + contribution;
                     }
                 }
             }

@@ -6,7 +6,9 @@ use xbrdf_core::{MaterialKind, Mesh, ResolvedBakeConfig, Triangle, Vec3};
 
 const SHADER: &str = include_str!("bake.wgsl");
 const BVH_LEAF_SIZE: usize = 4;
-const TARGET_RAY_TRACES_PER_DISPATCH: u64 = 250_000;
+const TARGET_RAY_TRACES_PER_DISPATCH: u64 = 1_024_000_000;
+const WORKGROUP_WIDTH: u32 = 8;
+const WORKGROUP_HEIGHT: u32 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GpuBakeError {
@@ -326,6 +328,12 @@ async fn bake_progressive_inner(
     while completed_samples < config.samples {
         let remaining = config.samples - completed_samples;
         let active_batch = batch_samples.min(remaining).max(1);
+        let rows_per_dispatch = rows_per_dispatch_for(
+            config.width,
+            config.height,
+            active_batch,
+            config.max_repeat_radius,
+        );
         let batch_start = Instant::now();
         let mut y_offset = 0;
         while y_offset < config.height {
@@ -350,7 +358,11 @@ async fn bake_progressive_inner(
                 });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(config.width.div_ceil(8), active_height.div_ceil(8), 1);
+                pass.dispatch_workgroups(
+                    config.width.div_ceil(WORKGROUP_WIDTH),
+                    active_height.div_ceil(WORKGROUP_HEIGHT),
+                    1,
+                );
             }
             queue.submit(Some(encoder.finish()));
             device.poll(wgpu::Maintain::Wait);
@@ -616,7 +628,11 @@ async fn bake_inner(
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(config.width.div_ceil(8), active_height.div_ceil(8), 1);
+            pass.dispatch_workgroups(
+                config.width.div_ceil(WORKGROUP_WIDTH),
+                active_height.div_ceil(WORKGROUP_HEIGHT),
+                1,
+            );
         }
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::Maintain::Wait);
@@ -870,11 +886,30 @@ fn gpu_triangle(triangle: Triangle) -> GpuTriangle {
 }
 
 fn rows_per_dispatch(config: &ResolvedBakeConfig) -> u32 {
-    let repeat_diameter = config.max_repeat_radius as u64 * 2 + 1;
-    let traces_per_row =
-        config.width as u64 * config.samples as u64 * repeat_diameter * repeat_diameter * 2;
+    rows_per_dispatch_for(
+        config.width,
+        config.height,
+        config.samples,
+        config.max_repeat_radius,
+    )
+}
+
+fn rows_per_dispatch_for(width: u32, height: u32, samples: u32, max_repeat_radius: u32) -> u32 {
+    let repeat_diameter = max_repeat_radius as u64 * 2 + 1;
+    let traces_per_row = width as u64 * samples as u64 * repeat_diameter * repeat_diameter * 2;
     let rows = (TARGET_RAY_TRACES_PER_DISPATCH / traces_per_row.max(1)).max(1);
-    rows.min(config.height as u64) as u32
+    let rows = rows.min(height as u64) as u32;
+    let rounded_rows = if height >= WORKGROUP_HEIGHT {
+        rows.max(WORKGROUP_HEIGHT)
+    } else {
+        rows
+    };
+    let rounded_rows = if rounded_rows >= WORKGROUP_HEIGHT {
+        rounded_rows.div_ceil(WORKGROUP_HEIGHT) * WORKGROUP_HEIGHT
+    } else {
+        rounded_rows
+    };
+    rounded_rows.max(1).min(height)
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
