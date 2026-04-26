@@ -5,8 +5,8 @@ pub mod reference;
 pub mod sampling;
 
 pub use config::{
-    BakeConfigFile, BakeOverrides, Manifest, MaterialConfigFile, MaterialKind, ResolvedBakeConfig,
-    ResolvedMaterial,
+    BakeConfigFile, BakeMode, BakeOverrides, Manifest, MaterialConfigFile, MaterialKind,
+    ResolvedBakeConfig, ResolvedMaterial, SamplerKind,
 };
 pub use geometry::{Bounds, ColorSource, Mesh, Triangle};
 pub use math::Vec3;

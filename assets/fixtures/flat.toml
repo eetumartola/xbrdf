@@ -3,6 +3,9 @@ obj = "flat.obj"
 # Output pano resolution. This is not read from the OBJ; the OBJ only supplies geometry and tile bounds.
 width = 16
 height = 8
+mode = "single"
+light_width = 8
+light_height = 4
 samples = 4
 light = [0.0, 1.0, -1.0]
 max_repeat_radius = 2

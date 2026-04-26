@@ -24,10 +24,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
-use xbrdf_core::{BakeConfigFile, BakeOverrides, Manifest, MaterialKind, Mesh, ResolvedBakeConfig};
-use xbrdf_gpu::{GpuBakeStats, ProgressiveBakeOptions, ProgressiveFrame};
+use xbrdf_core::{
+    BakeConfigFile, BakeMode, BakeOverrides, Manifest, MaterialKind, Mesh, ResolvedBakeConfig,
+    SamplerKind,
+};
+use xbrdf_gpu::{AtlasProgressFrame, GpuBakeStats, ProgressiveBakeOptions, ProgressiveFrame};
 
 const TITLE: &str = "xBRDF Bake";
+const MAX_GUI_SAMPLES: i32 = 100_000_000;
 
 fn main() {
     if let Err(error) = run() {
@@ -110,8 +114,13 @@ struct BakeSettings {
     out_dir: String,
     width: i32,
     height: i32,
+    mode_index: usize,
+    light_width: i32,
+    light_height: i32,
     samples: i32,
     max_repeat_radius: i32,
+    sampler_index: usize,
+    enable_shadows: bool,
     light: [f32; 3],
     tile_width: f32,
     tile_depth: f32,
@@ -129,8 +138,13 @@ impl Default for BakeSettings {
             out_dir: "out/gui".to_string(),
             width: 256,
             height: 64,
+            mode_index: 0,
+            light_width: 8,
+            light_height: 4,
             samples: 64,
             max_repeat_radius: 2,
+            sampler_index: 0,
+            enable_shadows: true,
             light: [0.0, 1.0, -1.0],
             tile_width: 0.0,
             tile_depth: 0.0,
@@ -147,6 +161,21 @@ impl BakeSettings {
         match self.material_index {
             1 => MaterialKind::SpecularPhong,
             _ => MaterialKind::Lambertian,
+        }
+    }
+
+    fn bake_mode(&self) -> BakeMode {
+        match self.mode_index {
+            1 => BakeMode::Full,
+            2 => BakeMode::Isotropic,
+            _ => BakeMode::Single,
+        }
+    }
+
+    fn sampler_kind(&self) -> SamplerKind {
+        match self.sampler_index {
+            1 => SamplerKind::Random,
+            _ => SamplerKind::Halton,
         }
     }
 }
@@ -235,7 +264,12 @@ impl AppState {
                 BakeEvent::Started { width, height } => {
                     self.preview = PreviewImage::new(width, height);
                     self.preview_dirty = true;
-                    self.total_samples = self.settings.samples.max(1) as u32;
+                    self.total_samples = if self.settings.bake_mode() == BakeMode::Single {
+                        self.settings.samples.max(1) as u32
+                    } else {
+                        let (_, _, _, _, light_count) = preview_extents(&self.settings);
+                        light_count
+                    };
                     self.completed_samples = 0;
                     self.progress = 0.0;
                     self.status = "Baking".to_string();
@@ -258,6 +292,24 @@ impl AppState {
                         frame.completed_samples, frame.total_samples
                     );
                 }
+                BakeEvent::AtlasFrame(frame) => {
+                    let image = PreviewImage::from_atlas_frame(&frame);
+                    if self.follow_latest || self.history.is_empty() {
+                        self.preview = image;
+                        self.preview_dirty = true;
+                    }
+                    self.completed_samples = frame.completed_tiles;
+                    self.total_samples = frame.total_tiles;
+                    self.progress = if frame.total_tiles > 0 {
+                        frame.completed_tiles as f32 / frame.total_tiles as f32
+                    } else {
+                        0.0
+                    };
+                    self.status = format!(
+                        "Baking atlas tile {} / {}",
+                        frame.completed_tiles, frame.total_tiles
+                    );
+                }
                 BakeEvent::Finished {
                     stats,
                     image,
@@ -268,7 +320,11 @@ impl AppState {
                     self.progress = 1.0;
                     self.completed_samples = self.total_samples;
                     self.last_stats = Some(stats);
-                    let label = format!("{} samples", self.total_samples);
+                    let label = if self.settings.bake_mode() == BakeMode::Single {
+                        format!("{} samples", self.total_samples)
+                    } else {
+                        format!("{} light tiles", self.total_samples)
+                    };
                     self.push_history(RenderSnapshot {
                         image: self.preview.clone(),
                         label,
@@ -318,6 +374,7 @@ enum BakeEvent {
         height: u32,
     },
     Frame(ProgressiveFrame),
+    AtlasFrame(AtlasProgressFrame),
     Finished {
         stats: GpuBakeStats,
         image: PathBuf,
@@ -355,13 +412,30 @@ impl PreviewImage {
         image
     }
 
+    fn from_atlas_frame(frame: &AtlasProgressFrame) -> Self {
+        let mut image = Self::new(frame.width, frame.height);
+        image.write_pixels(&frame.pixels);
+        image
+    }
+
     fn write_frame(&mut self, frame: &ProgressiveFrame) {
         if self.width != frame.width || self.height != frame.height || self.height == 0 {
             return;
         }
 
+        self.write_pixels(&frame.pixels);
+    }
+
+    fn write_pixels(&mut self, pixels: &[[f32; 3]]) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+
         let gain = 2.0_f32.powf(self.exposure);
-        for (index, src) in frame.pixels.iter().enumerate() {
+        for (index, src) in pixels.iter().enumerate() {
+            if index * 4 + 3 >= self.rgba.len() {
+                break;
+            }
             let dst = index * 4;
             self.rgba[dst] = to_preview_byte(src[0] * gain);
             self.rgba[dst + 1] = to_preview_byte(src[1] * gain);
@@ -436,17 +510,40 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
 
             ui.input_int("Width", &mut app.settings.width).build();
             ui.input_int("Height", &mut app.settings.height).build();
+            ui.combo_simple_string(
+                "Mode",
+                &mut app.settings.mode_index,
+                &["Single", "Full", "Isotropic"],
+            );
+            ui.input_int("Light width", &mut app.settings.light_width)
+                .build();
+            ui.input_int("Light height", &mut app.settings.light_height)
+                .build();
             ui.input_int("Samples", &mut app.settings.samples).build();
             ui.input_float("Update sec", &mut app.settings.update_interval_seconds)
                 .build();
             ui.input_int("Repeat radius", &mut app.settings.max_repeat_radius)
                 .build();
+            ui.combo_simple_string(
+                "Sampler",
+                &mut app.settings.sampler_index,
+                &["Halton", "Random"],
+            );
+            ui.checkbox("Shadows", &mut app.settings.enable_shadows);
             app.settings.width = app.settings.width.clamp(1, 16_384);
             app.settings.height = app.settings.height.clamp(1, 16_384);
-            app.settings.samples = app.settings.samples.clamp(1, 1_000_000);
+            app.settings.light_width = app.settings.light_width.clamp(1, 16_384);
+            app.settings.light_height = app.settings.light_height.clamp(1, 16_384);
+            app.settings.samples = app.settings.samples.clamp(1, MAX_GUI_SAMPLES);
             app.settings.update_interval_seconds =
                 app.settings.update_interval_seconds.clamp(0.05, 60.0);
             app.settings.max_repeat_radius = app.settings.max_repeat_radius.clamp(0, 16);
+            let (atlas_width, atlas_height, tile_width, tile_height, light_count) =
+                preview_extents(&app.settings);
+            ui.text(format!(
+                "Output {}x{}; tile {}x{}; {} light directions",
+                atlas_width, atlas_height, tile_width, tile_height, light_count
+            ));
 
             ui.input_float3("Light", &mut app.settings.light).build();
             ui.input_float("Tile width", &mut app.settings.tile_width)
@@ -473,10 +570,7 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
             }
             ProgressBar::new(app.progress)
                 .size([-1.0, 0.0])
-                .overlay_text(format!(
-                    "{} / {} samples",
-                    app.completed_samples, app.total_samples
-                ))
+                .overlay_text(progress_label(app))
                 .build(ui);
             ui.text_wrapped(&app.status);
             if let Some(stats) = &app.last_stats {
@@ -521,6 +615,14 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
                 ui.text("No preview yet");
             }
         });
+}
+
+fn progress_label(app: &AppState) -> String {
+    if app.settings.bake_mode() == BakeMode::Single {
+        format!("{} / {} samples", app.completed_samples, app.total_samples)
+    } else {
+        format!("{} / {} tiles", app.completed_samples, app.total_samples)
+    }
 }
 
 fn draw_history_controls(ui: &Ui, app: &mut AppState, width: f32) {
@@ -621,30 +723,45 @@ where
         .with_context(|| format!("failed to create output directory {}", out_dir.display()))?;
 
     send(BakeEvent::Started {
-        width: config.width,
-        height: config.height,
+        width: config.atlas_width(),
+        height: config.atlas_height(),
     });
 
-    let result = pollster::block_on(xbrdf_gpu::bake_progressive(
-        &config,
-        &mesh,
-        ProgressiveBakeOptions {
-            update_interval: Duration::from_secs_f32(settings.update_interval_seconds.max(0.05)),
-        },
-        |frame| {
-            send(BakeEvent::Frame(frame));
-        },
-    ))
-    .context("GPU bake failed")?;
+    let result = if config.light_count() == 1 && config.mode == BakeMode::Single {
+        pollster::block_on(xbrdf_gpu::bake_progressive(
+            &config,
+            &mesh,
+            ProgressiveBakeOptions {
+                update_interval: Duration::from_secs_f32(
+                    settings.update_interval_seconds.max(0.05),
+                ),
+            },
+            |frame| {
+                send(BakeEvent::Frame(frame));
+            },
+        ))
+        .context("GPU bake failed")?
+    } else {
+        send(BakeEvent::Status("Baking atlas".to_string()));
+        let result = pollster::block_on(xbrdf_gpu::bake_atlas_with_progress(
+            &config,
+            &mesh,
+            |frame| {
+                send(BakeEvent::AtlasFrame(frame));
+            },
+        ))
+        .context("GPU atlas bake failed")?;
+        result
+    };
 
     send(BakeEvent::Status("Writing output".to_string()));
     let image_path = out_dir.join("xbrdf_view.exr");
     write_rgb_file(
         &image_path,
-        config.width as usize,
-        config.height as usize,
+        config.atlas_width() as usize,
+        config.atlas_height() as usize,
         |x, y| {
-            let pixel = result.pixels[y * config.width as usize + x];
+            let pixel = result.pixels[y * config.atlas_width() as usize + x];
             (pixel[0], pixel[1], pixel[2])
         },
     )
@@ -680,17 +797,47 @@ fn resolve_settings(settings: &BakeSettings) -> Result<ResolvedBakeConfig> {
                 obj: trimmed_path(&settings.obj_path).map(resolve_gui_override_path),
                 width: Some(settings.width.max(1) as u32),
                 height: Some(settings.height.max(1) as u32),
+                mode: Some(settings.bake_mode()),
+                light_width: Some(settings.light_width.max(1) as u32),
+                light_height: Some(settings.light_height.max(1) as u32),
                 samples: Some(settings.samples.max(1) as u32),
                 tile_width: positive_override(settings.tile_width),
                 tile_depth: positive_override(settings.tile_depth),
                 light: Some(settings.light),
                 max_repeat_radius: Some(settings.max_repeat_radius.clamp(0, 16) as u32),
+                sampler: Some(settings.sampler_kind()),
+                enable_shadows: Some(settings.enable_shadows),
                 material_kind: Some(settings.material_kind()),
                 material_color: Some(settings.material_color),
                 material_roughness: Some(settings.roughness),
             },
         )
         .context("failed to resolve bake settings")
+}
+
+fn preview_extents(settings: &BakeSettings) -> (u32, u32, u32, u32, u32) {
+    let camera_width = settings.width.max(1) as u32;
+    let camera_height = settings.height.max(1) as u32;
+    let light_width = settings.light_width.max(1) as u32;
+    let light_height = settings.light_height.max(1) as u32;
+
+    match settings.bake_mode() {
+        BakeMode::Single => (camera_width, camera_height, camera_width, camera_height, 1),
+        BakeMode::Full => (
+            camera_width * light_width,
+            camera_height * light_height,
+            camera_width,
+            camera_height,
+            light_width * light_height,
+        ),
+        BakeMode::Isotropic => (
+            light_width,
+            camera_height * light_height,
+            1,
+            camera_height,
+            light_width * light_height,
+        ),
+    }
 }
 
 fn load_config_into_settings(settings: &mut BakeSettings) -> Result<()> {
@@ -703,8 +850,20 @@ fn load_config_into_settings(settings: &mut BakeSettings) -> Result<()> {
     settings.obj_path = path_to_gui_string(&config.obj);
     settings.width = config.width as i32;
     settings.height = config.height as i32;
+    settings.mode_index = match config.mode {
+        BakeMode::Single => 0,
+        BakeMode::Full => 1,
+        BakeMode::Isotropic => 2,
+    };
+    settings.light_width = config.light_width as i32;
+    settings.light_height = config.light_height as i32;
     settings.samples = config.samples as i32;
     settings.max_repeat_radius = config.max_repeat_radius as i32;
+    settings.sampler_index = match config.sampler {
+        SamplerKind::Halton => 0,
+        SamplerKind::Random => 1,
+    };
+    settings.enable_shadows = config.enable_shadows;
     settings.light = config.light;
     settings.tile_width = config.tile_width_override.unwrap_or(0.0);
     settings.tile_depth = config.tile_depth_override.unwrap_or(0.0);

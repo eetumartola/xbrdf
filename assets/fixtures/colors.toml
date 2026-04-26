@@ -2,6 +2,9 @@ obj = "colors.obj"
 
 width = 32
 height = 16
+mode = "single"
+light_width = 8
+light_height = 4
 samples = 16
 light = [0.0, 1.0, -1.0]
 max_repeat_radius = 2

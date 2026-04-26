@@ -3,7 +3,9 @@ use clap::{Args, Parser, Subcommand};
 use exr::prelude::write_rgb_file;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use xbrdf_core::{BakeConfigFile, BakeOverrides, Manifest, MaterialKind, Mesh};
+use xbrdf_core::{
+    BakeConfigFile, BakeMode, BakeOverrides, Manifest, MaterialKind, Mesh, SamplerKind,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "xbrdf-bake")]
@@ -32,6 +34,12 @@ struct BakeArgs {
     width: Option<u32>,
     #[arg(long)]
     height: Option<u32>,
+    #[arg(long, value_parser = parse_bake_mode)]
+    mode: Option<BakeMode>,
+    #[arg(long)]
+    light_width: Option<u32>,
+    #[arg(long)]
+    light_height: Option<u32>,
     #[arg(long)]
     samples: Option<u32>,
     #[arg(long)]
@@ -42,6 +50,10 @@ struct BakeArgs {
     light: Option<[f32; 3]>,
     #[arg(long)]
     max_repeat_radius: Option<u32>,
+    #[arg(long, value_parser = parse_sampler_kind)]
+    sampler: Option<SamplerKind>,
+    #[arg(long)]
+    enable_shadows: Option<bool>,
     #[arg(long, value_parser = parse_material_kind)]
     material: Option<MaterialKind>,
     #[arg(long, value_parser = parse_vec3)]
@@ -76,11 +88,16 @@ fn bake(args: BakeArgs) -> Result<()> {
                 obj: args.obj,
                 width: args.width,
                 height: args.height,
+                mode: args.mode,
+                light_width: args.light_width,
+                light_height: args.light_height,
                 samples: args.samples,
                 tile_width: args.tile_width,
                 tile_depth: args.tile_depth,
                 light: args.light,
                 max_repeat_radius: args.max_repeat_radius,
+                sampler: args.sampler,
+                enable_shadows: args.enable_shadows,
                 material_kind: args.material,
                 material_color: args.material_color,
                 material_roughness: args.roughness,
@@ -107,16 +124,16 @@ fn bake(args: BakeArgs) -> Result<()> {
         .with_context(|| format!("failed to create output directory {}", out.display()))?;
 
     let gpu_result =
-        pollster::block_on(xbrdf_gpu::bake(&resolved, &mesh)).context("GPU bake failed")?;
+        pollster::block_on(xbrdf_gpu::bake_atlas(&resolved, &mesh)).context("GPU bake failed")?;
 
     let write_start = Instant::now();
     let image_path = out.join("xbrdf_view.exr");
     write_rgb_file(
         &image_path,
-        resolved.width as usize,
-        resolved.height as usize,
+        resolved.atlas_width() as usize,
+        resolved.atlas_height() as usize,
         |x, y| {
-            let pixel = gpu_result.pixels[y * resolved.width as usize + x];
+            let pixel = gpu_result.pixels[y * resolved.atlas_width() as usize + x];
             (pixel[0], pixel[1], pixel[2])
         },
     )
@@ -159,7 +176,7 @@ fn print_stats(
     stats: &xbrdf_gpu::GpuBakeStats,
     times: PhaseTimes,
 ) {
-    let pixel_count = resolved.width as u64 * resolved.height as u64;
+    let pixel_count = stats.width as u64 * stats.height as u64;
     let rays_per_second = if stats.gpu_dispatch_time.as_secs_f64() > 0.0 {
         stats.camera_ray_count as f64 / stats.gpu_dispatch_time.as_secs_f64()
     } else {
@@ -171,6 +188,15 @@ fn print_stats(
     println!(
         "  image: {}x{} ({} pixels)",
         stats.width, stats.height, pixel_count
+    );
+    println!(
+        "  mode: {}, camera tile {}x{}, light grid {}x{} ({} light directions)",
+        resolved.mode,
+        resolved.camera_tile_width(),
+        resolved.camera_tile_height(),
+        resolved.effective_light_width(),
+        resolved.effective_light_height(),
+        resolved.light_count()
     );
     println!(
         "  geometry: {} triangles, {} BVH nodes",
@@ -188,16 +214,42 @@ fn print_stats(
         mesh.y_offset_to_zero
     );
     println!(
-        "  sampling: {} samples/pixel, {} camera rays, max repeat radius {}, max {} periodic copies/ray",
+        "  sampling: {} samples/pixel, {}, {} camera rays, max repeat radius {}, max {} periodic copies/ray",
         stats.samples,
+        resolved.sampler,
         stats.camera_ray_count,
         stats.max_repeat_radius,
         stats.max_periodic_copies_per_ray
     );
     println!(
-        "  dispatch: {} row chunks, {} rows/chunk, max {} BVH traces including shadows",
-        stats.dispatch_count, stats.rows_per_dispatch, stats.max_bvh_traces
+        "  shadows: {}",
+        if resolved.enable_shadows {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
+    let trace_label = if resolved.enable_shadows {
+        "including shadows"
+    } else {
+        "camera visibility only"
+    };
+    if stats.sample_lanes > 1 {
+        println!(
+            "  dispatch: {} sample waves, {} rows/wave, up to {} sample lanes x {} samples/lane, max {} BVH traces ({})",
+            stats.dispatch_count,
+            stats.rows_per_dispatch,
+            stats.sample_lanes,
+            stats.samples_per_lane,
+            stats.max_bvh_traces,
+            trace_label
+        );
+    } else {
+        println!(
+            "  dispatch: {} row chunks, {} rows/chunk, max {} BVH traces ({})",
+            stats.dispatch_count, stats.rows_per_dispatch, stats.max_bvh_traces, trace_label
+        );
+    }
     println!(
         "  material: {} color=({:.3}, {:.3}, {:.3}) roughness={}",
         resolved.material.kind,
@@ -253,5 +305,13 @@ fn parse_vec3(value: &str) -> Result<[f32; 3], String> {
 }
 
 fn parse_material_kind(value: &str) -> Result<MaterialKind, String> {
+    value.parse()
+}
+
+fn parse_bake_mode(value: &str) -> Result<BakeMode, String> {
+    value.parse()
+}
+
+fn parse_sampler_kind(value: &str) -> Result<SamplerKind, String> {
     value.parse()
 }

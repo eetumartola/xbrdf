@@ -1,4 +1,5 @@
 use crate::math::Vec3;
+use crate::sampling::hemisphere_latlong_direction;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::str::FromStr;
 const DEFAULT_WIDTH: u32 = 256;
 const DEFAULT_HEIGHT: u32 = 64;
 const DEFAULT_SAMPLES: u32 = 64;
+const DEFAULT_LIGHT_WIDTH: u32 = 8;
+const DEFAULT_LIGHT_HEIGHT: u32 = 4;
 const DEFAULT_LIGHT: [f32; 3] = [0.0, 1.0, -1.0];
 const DEFAULT_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 const DEFAULT_SPECULAR_ROUGHNESS: f32 = 0.05;
@@ -21,11 +24,16 @@ pub struct BakeConfigFile {
     pub obj: Option<PathBuf>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub mode: Option<BakeMode>,
+    pub light_width: Option<u32>,
+    pub light_height: Option<u32>,
     pub samples: Option<u32>,
     pub tile_width: Option<f32>,
     pub tile_depth: Option<f32>,
     pub light: Option<[f32; 3]>,
     pub max_repeat_radius: Option<u32>,
+    pub sampler: Option<SamplerKind>,
+    pub enable_shadows: Option<bool>,
     pub material: MaterialConfigFile,
 }
 
@@ -42,11 +50,16 @@ pub struct BakeOverrides {
     pub obj: Option<PathBuf>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub mode: Option<BakeMode>,
+    pub light_width: Option<u32>,
+    pub light_height: Option<u32>,
     pub samples: Option<u32>,
     pub tile_width: Option<f32>,
     pub tile_depth: Option<f32>,
     pub light: Option<[f32; 3]>,
     pub max_repeat_radius: Option<u32>,
+    pub sampler: Option<SamplerKind>,
+    pub enable_shadows: Option<bool>,
     pub material_kind: Option<MaterialKind>,
     pub material_color: Option<[f32; 3]>,
     pub material_roughness: Option<f32>,
@@ -57,11 +70,16 @@ pub struct ResolvedBakeConfig {
     pub obj: PathBuf,
     pub width: u32,
     pub height: u32,
+    pub mode: BakeMode,
+    pub light_width: u32,
+    pub light_height: u32,
     pub samples: u32,
     pub tile_width_override: Option<f32>,
     pub tile_depth_override: Option<f32>,
     pub light: [f32; 3],
     pub max_repeat_radius: u32,
+    pub sampler: SamplerKind,
+    pub enable_shadows: bool,
     pub material: ResolvedMaterial,
 }
 
@@ -71,6 +89,21 @@ pub enum MaterialKind {
     Lambertian,
     #[serde(alias = "specular")]
     SpecularPhong,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BakeMode {
+    Single,
+    Full,
+    Isotropic,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplerKind {
+    Halton,
+    Random,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,6 +149,8 @@ pub struct OutputInfo {
     pub channels: String,
     pub width: u32,
     pub height: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,8 +167,16 @@ pub struct ConventionInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BakeInfo {
+    pub mode: BakeMode,
     pub samples_per_direction: u32,
     pub max_repeat_radius: u32,
+    pub camera_width: u32,
+    pub camera_height: u32,
+    pub light_width: u32,
+    pub light_height: u32,
+    pub light_count: u32,
+    pub sampler: SamplerKind,
+    pub enable_shadows: bool,
     pub light_direction_surface_to_light: [f32; 3],
     pub material: MaterialInfo,
     pub transport: String,
@@ -187,6 +230,62 @@ impl MaterialKind {
     }
 }
 
+impl SamplerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SamplerKind::Halton => "halton",
+            SamplerKind::Random => "random",
+        }
+    }
+}
+
+impl BakeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BakeMode::Single => "single",
+            BakeMode::Full => "full",
+            BakeMode::Isotropic => "isotropic",
+        }
+    }
+}
+
+impl fmt::Display for BakeMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BakeMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "single" | "fixed" | "fixed_light" | "fixed-light" => Ok(Self::Single),
+            "full" | "anisotropic" | "4d" => Ok(Self::Full),
+            "isotropic" | "iso" => Ok(Self::Isotropic),
+            _ => Err(format!("expected one of: single, full, isotropic")),
+        }
+    }
+}
+
+impl fmt::Display for SamplerKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SamplerKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "halton" | "qmc" | "low_discrepancy" | "low-discrepancy" => Ok(Self::Halton),
+            "random" | "hashed" | "hash" => Ok(Self::Random),
+            _ => Err(format!("expected one of: halton, random")),
+        }
+    }
+}
+
 impl fmt::Display for MaterialKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -234,6 +333,70 @@ impl ResolvedMaterial {
     }
 }
 
+impl ResolvedBakeConfig {
+    pub fn camera_tile_width(&self) -> u32 {
+        match self.mode {
+            BakeMode::Isotropic => 1,
+            BakeMode::Single | BakeMode::Full => self.width,
+        }
+    }
+
+    pub fn camera_tile_height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn atlas_width(&self) -> u32 {
+        self.camera_tile_width() * self.effective_light_width()
+    }
+
+    pub fn atlas_height(&self) -> u32 {
+        self.camera_tile_height() * self.effective_light_height()
+    }
+
+    pub fn effective_light_width(&self) -> u32 {
+        match self.mode {
+            BakeMode::Single => 1,
+            BakeMode::Full | BakeMode::Isotropic => self.light_width,
+        }
+    }
+
+    pub fn effective_light_height(&self) -> u32 {
+        match self.mode {
+            BakeMode::Single => 1,
+            BakeMode::Full | BakeMode::Isotropic => self.light_height,
+        }
+    }
+
+    pub fn light_count(&self) -> u32 {
+        self.effective_light_width() * self.effective_light_height()
+    }
+
+    pub fn light_direction_for_tile(&self, light_x: u32, light_y: u32) -> [f32; 3] {
+        if self.mode == BakeMode::Single {
+            return self.light;
+        }
+
+        hemisphere_latlong_direction(
+            light_x,
+            light_y,
+            self.effective_light_width(),
+            self.effective_light_height(),
+        )
+        .to_array()
+    }
+
+    pub fn config_for_tile(&self, light_x: u32, light_y: u32) -> Self {
+        let mut config = self.clone();
+        config.width = self.camera_tile_width();
+        config.height = self.camera_tile_height();
+        config.light = self.light_direction_for_tile(light_x, light_y);
+        config.mode = BakeMode::Single;
+        config.light_width = 1;
+        config.light_height = 1;
+        config
+    }
+}
+
 impl BakeConfigFile {
     pub fn read(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadConfig {
@@ -263,6 +426,19 @@ impl BakeConfigFile {
         let width = overrides.width.or(self.width).unwrap_or(DEFAULT_WIDTH);
         let height = overrides.height.or(self.height).unwrap_or(DEFAULT_HEIGHT);
         if width == 0 || height == 0 {
+            return Err(ConfigError::InvalidResolution);
+        }
+
+        let mode = overrides.mode.or(self.mode).unwrap_or(BakeMode::Single);
+        let light_width = overrides
+            .light_width
+            .or(self.light_width)
+            .unwrap_or(DEFAULT_LIGHT_WIDTH);
+        let light_height = overrides
+            .light_height
+            .or(self.light_height)
+            .unwrap_or(DEFAULT_LIGHT_HEIGHT);
+        if light_width == 0 || light_height == 0 {
             return Err(ConfigError::InvalidResolution);
         }
 
@@ -301,11 +477,22 @@ impl BakeConfigFile {
             obj,
             width,
             height,
+            mode,
+            light_width,
+            light_height,
             samples,
             tile_width_override,
             tile_depth_override,
             light,
             max_repeat_radius,
+            sampler: overrides
+                .sampler
+                .or(self.sampler)
+                .unwrap_or(SamplerKind::Halton),
+            enable_shadows: overrides
+                .enable_shadows
+                .or(self.enable_shadows)
+                .unwrap_or(true),
             material,
         })
     }
@@ -334,8 +521,10 @@ impl Manifest {
                 image: "xbrdf_view.exr".to_string(),
                 format: "OpenEXR".to_string(),
                 channels: "RGB f32".to_string(),
-                width: config.width,
-                height: config.height,
+                width: config.atlas_width(),
+                height: config.atlas_height(),
+                tile_width: config.camera_tile_width(),
+                tile_height: config.camera_tile_height(),
             },
             convention: ConventionInfo {
                 coordinate_system: "Houdini Y-up, sample tile in XZ".to_string(),
@@ -352,8 +541,16 @@ impl Manifest {
                         .to_string(),
             },
             bake: BakeInfo {
+                mode: config.mode,
                 samples_per_direction: config.samples,
                 max_repeat_radius: config.max_repeat_radius,
+                camera_width: config.camera_tile_width(),
+                camera_height: config.camera_tile_height(),
+                light_width: config.effective_light_width(),
+                light_height: config.effective_light_height(),
+                light_count: config.light_count(),
+                sampler: config.sampler,
+                enable_shadows: config.enable_shadows,
                 light_direction_surface_to_light: config.light,
                 material: MaterialInfo {
                     kind: config.material.kind,
@@ -362,7 +559,11 @@ impl Manifest {
                     phong_exponent: config.material.phong_exponent(),
                     model: config.material.model_description(),
                 },
-                transport: "direct lighting with visibility/shadow rays only".to_string(),
+                transport: if config.enable_shadows {
+                    "direct lighting with visibility and shadow rays".to_string()
+                } else {
+                    "direct lighting with camera visibility only; shadow rays disabled".to_string()
+                },
             },
         }
     }
@@ -431,11 +632,16 @@ mod tests {
             obj: Some("asset.obj".into()),
             width: Some(8),
             height: None,
+            mode: None,
+            light_width: None,
+            light_height: None,
             samples: Some(2),
             tile_width: None,
             tile_depth: None,
             light: None,
             max_repeat_radius: None,
+            sampler: None,
+            enable_shadows: None,
             material: MaterialConfigFile::default(),
         };
         let overrides = BakeOverrides {
@@ -451,9 +657,14 @@ mod tests {
         assert_eq!(resolved.obj, PathBuf::from("assets/fixtures/asset.obj"));
         assert_eq!(resolved.width, 16);
         assert_eq!(resolved.height, DEFAULT_HEIGHT);
+        assert_eq!(resolved.mode, BakeMode::Single);
+        assert_eq!(resolved.atlas_width(), 16);
+        assert_eq!(resolved.atlas_height(), DEFAULT_HEIGHT);
         assert_eq!(resolved.samples, 2);
         assert_eq!(resolved.light, [0.0, 1.0, 0.0]);
         assert_eq!(resolved.max_repeat_radius, DEFAULT_MAX_REPEAT_RADIUS);
+        assert_eq!(resolved.sampler, SamplerKind::Halton);
+        assert!(resolved.enable_shadows);
         assert_eq!(resolved.material.kind, MaterialKind::Lambertian);
     }
 
@@ -475,6 +686,45 @@ mod tests {
         assert_eq!(resolved.material.color, [0.8, 0.9, 1.0]);
         assert_eq!(resolved.material.roughness, Some(0.0));
         assert_eq!(resolved.material.phong_exponent(), Some(MAX_PHONG_EXPONENT));
+    }
+
+    #[test]
+    fn atlas_dimensions_follow_bake_mode() {
+        let base = ResolvedBakeConfig {
+            obj: "flat.obj".into(),
+            width: 16,
+            height: 8,
+            mode: BakeMode::Full,
+            light_width: 4,
+            light_height: 3,
+            samples: 1,
+            tile_width_override: None,
+            tile_depth_override: None,
+            light: [0.0, 1.0, 0.0],
+            max_repeat_radius: DEFAULT_MAX_REPEAT_RADIUS,
+            sampler: SamplerKind::Halton,
+            enable_shadows: true,
+            material: ResolvedMaterial {
+                kind: MaterialKind::Lambertian,
+                color: [1.0, 1.0, 1.0],
+                roughness: None,
+            },
+        };
+
+        assert_eq!(base.camera_tile_width(), 16);
+        assert_eq!(base.camera_tile_height(), 8);
+        assert_eq!(base.atlas_width(), 64);
+        assert_eq!(base.atlas_height(), 24);
+        assert_eq!(base.light_count(), 12);
+
+        let isotropic = ResolvedBakeConfig {
+            mode: BakeMode::Isotropic,
+            ..base
+        };
+        assert_eq!(isotropic.camera_tile_width(), 1);
+        assert_eq!(isotropic.camera_tile_height(), 8);
+        assert_eq!(isotropic.atlas_width(), 4);
+        assert_eq!(isotropic.atlas_height(), 24);
     }
 
     #[test]
@@ -500,11 +750,16 @@ mod tests {
             obj: "flat.obj".into(),
             width: 4,
             height: 2,
+            mode: BakeMode::Single,
+            light_width: DEFAULT_LIGHT_WIDTH,
+            light_height: DEFAULT_LIGHT_HEIGHT,
             samples: 1,
             tile_width_override: None,
             tile_depth_override: None,
             light: [0.0, 1.0, 0.0],
             max_repeat_radius: DEFAULT_MAX_REPEAT_RADIUS,
+            sampler: SamplerKind::Halton,
+            enable_shadows: true,
             material: ResolvedMaterial {
                 kind: MaterialKind::Lambertian,
                 color: [1.0, 1.0, 1.0],

@@ -34,6 +34,8 @@ struct Params {
     active_height: u32,
     sample_offset: u32,
     target_samples: u32,
+    sample_limit: u32,
+    sample_lanes: u32,
     tile_min: vec2<f32>,
     tile_size: vec2<f32>,
     bounds_min: vec4<f32>,
@@ -94,16 +96,41 @@ fn radical_inverse_vdc(bits_in: u32) -> f32 {
     return f32(bits) * 2.3283064365386963e-10;
 }
 
+fn radical_inverse_base3(index_in: u32) -> f32 {
+    var index = index_in;
+    var inv_base = 1.0 / 3.0;
+    var inv_digit = inv_base;
+    var result = 0.0;
+    loop {
+        if (index == 0u) {
+            break;
+        }
+        let digit = index % 3u;
+        result = result + f32(digit) * inv_digit;
+        index = index / 3u;
+        inv_digit = inv_digit * inv_base;
+    }
+    return result;
+}
+
 fn sample_2d(sample_index: u32, pixel_x: u32, pixel_y: u32) -> vec2<f32> {
-    let global_sample = params.sample_offset + sample_index;
-    let pixel_seed = pixel_x * 1973u + pixel_y * 9277u + params.target_samples * 26699u;
+    let global_sample = sample_index;
+    let pixel_seed = pixel_x * 1973u + pixel_y * 9277u;
+    if (params.material_kind.y == 1u) {
+        let seed = pixel_seed ^ (global_sample * 0x9e3779b9u);
+        return vec2<f32>(
+            hash_float(seed),
+            hash_float(seed ^ 0x85ebca6bu)
+        );
+    }
+
     let rotation = vec2<f32>(
         hash_float(pixel_seed),
         hash_float(pixel_seed ^ 0x9e3779b9u)
     );
     let base = vec2<f32>(
-        (f32(global_sample) + 0.5) / f32(params.target_samples),
-        radical_inverse_vdc(global_sample)
+        radical_inverse_vdc(global_sample),
+        radical_inverse_base3(global_sample)
     );
     return fract(base + rotation);
 }
@@ -298,10 +325,8 @@ fn any_bvh_hit(origin: vec3<f32>, direction: vec3<f32>, offset: vec3<f32>) -> bo
     return false;
 }
 
-fn trace_periodic(origin: vec3<f32>, direction: vec3<f32>) -> Hit {
+fn trace_periodic(origin: vec3<f32>, direction: vec3<f32>, rx: i32, rz: i32) -> Hit {
     var hit = Hit(false, 3.402823466e+38, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(1.0));
-    let rx = repeat_radius(direction, 0u);
-    let rz = repeat_radius(direction, 1u);
 
     for (var oz = -rz; oz <= rz; oz = oz + 1) {
         for (var ox = -rx; ox <= rx; ox = ox + 1) {
@@ -320,10 +345,7 @@ fn trace_periodic(origin: vec3<f32>, direction: vec3<f32>) -> Hit {
     return hit;
 }
 
-fn any_shadow_hit(origin: vec3<f32>, direction: vec3<f32>) -> bool {
-    let rx = shadow_repeat_radius(direction, 0u);
-    let rz = shadow_repeat_radius(direction, 1u);
-
+fn any_shadow_hit(origin: vec3<f32>, direction: vec3<f32>, rx: i32, rz: i32) -> bool {
     for (var oz = -rz; oz <= rz; oz = oz + 1) {
         for (var ox = -rx; ox <= rx; ox = ox + 1) {
             let offset = vec3<f32>(
@@ -358,11 +380,55 @@ fn evaluate_material(n: vec3<f32>, light_dir: vec3<f32>, wo: vec3<f32>) -> vec3<
     return params.material_color.xyz * (n_dot_l * INV_PI * inv_macro_irradiance);
 }
 
+fn shade_samples(x: u32, y: u32, sample_start: u32, sample_count: u32, wo: vec3<f32>) -> vec3<f32> {
+    let ray_direction = -wo;
+    let margin = params.material_params.y;
+    let top_y = params.bounds_max.y + margin;
+    let target_y = params.bounds_min.y - margin;
+    let camera_rx = repeat_radius(ray_direction, 0u);
+    let camera_rz = repeat_radius(ray_direction, 1u);
+    let shadow_rx = shadow_repeat_radius(params.light_dir.xyz, 0u);
+    let shadow_rz = shadow_repeat_radius(params.light_dir.xyz, 1u);
+    var sum = vec3<f32>(0.0);
+
+    for (var sample = 0u; sample < sample_count; sample = sample + 1u) {
+        let uv = sample_2d(sample_start + sample, x, y);
+        let sample_target = vec3<f32>(
+            params.tile_min.x + uv.x * params.tile_size.x,
+            target_y,
+            params.tile_min.y + uv.y * params.tile_size.y
+        );
+        let travel = (top_y - sample_target.y) / max(wo.y, EPSILON);
+        let origin = sample_target + wo * travel;
+        let hit = trace_periodic(origin, ray_direction, camera_rx, camera_rz);
+
+        if (hit.found) {
+            let n = hit.normal;
+            if (dot(n, wo) > 0.0) {
+                let contribution = hit.color * evaluate_material(n, params.light_dir.xyz, wo);
+                if (any(contribution > vec3<f32>(0.0))) {
+                    if (params.material_kind.z == 0u) {
+                        sum = sum + contribution;
+                    } else {
+                        let shadow_origin = hit.position + params.light_dir.xyz * HIT_EPSILON * 4.0;
+                        if (!any_shadow_hit(shadow_origin, params.light_dir.xyz, shadow_rx, shadow_rz)) {
+                            sum = sum + contribution;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return sum;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = id.x;
     let local_y = id.y;
-    if (x >= params.width || local_y >= params.active_height) {
+    let sample_lane = id.z;
+    if (x >= params.width || local_y >= params.active_height || sample_lane >= params.sample_lanes) {
         return;
     }
 
@@ -371,39 +437,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let out_index = y * params.width + x;
+    let pixel_count = params.width * params.height;
+    let out_index = sample_lane * pixel_count + y * params.width + x;
     let wo = direction_from_pixel(x, y);
-    let ray_direction = -wo;
-    let margin = params.material_params.y;
-    let top_y = params.bounds_max.y + margin;
-    let target_y = params.bounds_min.y - margin;
-    var sum = vec3<f32>(0.0);
 
-    for (var sample = 0u; sample < params.samples; sample = sample + 1u) {
-        let uv = sample_2d(sample, x, y);
-        let sample_target = vec3<f32>(
-            params.tile_min.x + uv.x * params.tile_size.x,
-            target_y,
-            params.tile_min.y + uv.y * params.tile_size.y
-        );
-        let travel = (top_y - sample_target.y) / max(wo.y, EPSILON);
-        let origin = sample_target + wo * travel;
-        let hit = trace_periodic(origin, ray_direction);
-
-        if (hit.found) {
-            let n = hit.normal;
-            if (dot(n, wo) > 0.0) {
-                let contribution = hit.color * evaluate_material(n, params.light_dir.xyz, wo);
-                if (any(contribution > vec3<f32>(0.0))) {
-                    let shadow_origin = hit.position + params.light_dir.xyz * HIT_EPSILON * 4.0;
-                    if (!any_shadow_hit(shadow_origin, params.light_dir.xyz)) {
-                        sum = sum + contribution;
-                    }
-                }
-            }
-        }
+    let sample_start = params.sample_offset + sample_lane * params.samples;
+    if (sample_start >= params.sample_limit) {
+        output_pixels[out_index] = vec4<f32>(0.0);
+        return;
     }
 
-    let rgb = sum / f32(params.samples);
-    output_pixels[out_index] = vec4<f32>(rgb, 1.0);
+    let active_samples = min(params.samples, params.sample_limit - sample_start);
+    let sum = shade_samples(x, y, sample_start, active_samples, wo);
+    if (params.sample_lanes == 1u && params.samples == params.target_samples) {
+        output_pixels[out_index] = vec4<f32>(sum / f32(active_samples), 1.0);
+    } else {
+        output_pixels[out_index] = vec4<f32>(sum, f32(active_samples));
+    }
 }
