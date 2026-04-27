@@ -85,6 +85,14 @@ Build xBRDF as a Rust GPU baker plus later preview/shader tooling. The MVP is a 
 - 2026-04-27: Fixture TOMLs now explicitly include `mode`, `light_width`, and `light_height` so atlas dimensions are reproducible from config files rather than relying on CLI-only overrides.
 - 2026-04-27: Atlas bakes now report GUI progress tile by tile and update the viewport with completed light tiles. Atlas bakes reuse one sample-parallel GPU context and BVH across all light tiles instead of rebuilding GPU resources per light direction.
 - 2026-04-27: `cargo check -p xbrdf-gpu -p xbrdf-gui` passed with `CARGO_INCREMENTAL=0` and a temp target directory after the atlas progress/shared-context change. `cargo run -p xbrdf-cli -- --config assets/fixtures/flat.toml --mode full --light-width 2 --light-height 2 --samples 4 --out out/flat_full_progress_check_low` passed and wrote a 32x16 atlas through the shared-context path.
+- 2026-04-27: Added a GUI 3D preview window. It renders a torus with the currently selected 2D preview/history texture and uses separate shader lookup paths for `single`, `full`, and `isotropic` data, with manual wrap/clamp interpolation across camera panos and light-grid atlas tiles.
+- 2026-04-27: The 3D preview image now captures mouse drags to rotate the torus instead of moving the ImGui window. Double-clicking the preview resets the rotation.
+- 2026-04-27: Updated the 3D preview to use quaternion object rotation and a torus `ds`/`dt` tangent frame for the full anisotropic lookup. The preview shader now treats the xBRDF patch as laid on the object surface and samples only positive local view/light hemispheres.
+- 2026-04-27: Added the local macro cosine term to the 3D preview shader after xBRDF lookup. The bake remains an effective BRDF-like table normalized by macro incident irradiance, while consuming shaders multiply by `max(dot(N, L), 0)` for direct lighting.
+- 2026-04-27: Added a 3D preview model selector. The GUI now offers the synthetic torus plus FBX files from `assets/preview`, centers and scales selected FBX models to fit the preview camera, and uses FBX UV `du`/`dv` as anisotropic tangent directions when available.
+- 2026-04-27: `cargo test -p xbrdf-gui preview_pig_fbx_loads_when_present` passed, validating that `assets/preview/pig.fbx` loads through the GUI preview-model path.
+- 2026-04-27: Preview FBX models now use smoothed normals and smoothed tangent frames for display. The bake geometry remains faceted; smoothing is only for the 3D preview object's macro surface.
+- 2026-04-27: Added GUI save/load commands for the selected atlas. `Save Current Atlas` writes float EXR data to `xbrdf_current_atlas.exr` in the output folder, and `Load Current Atlas` restores that EXR into the 2D/3D preview using the current GUI atlas metadata.
 
 ## Acceptance Criteria
 

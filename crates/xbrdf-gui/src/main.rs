@@ -1,15 +1,21 @@
 use anyhow::{Context, Result};
-use exr::prelude::write_rgb_file;
+use exr::prelude::{read_first_rgba_layer_from_file, write_rgb_file};
+use fbx::{Node, Property};
+use glium::framebuffer::SimpleFrameBuffer;
+use glium::index::PrimitiveType;
+use glium::texture::DepthTexture2d;
 use glium::texture::{ClientFormat, RawImage2d, Texture2d};
+use glium::uniform;
 use glium::uniforms::{MagnifySamplerFilter, MinifySamplerFilter, SamplerBehavior};
 use glium::Surface;
+use glium::{IndexBuffer, Program, VertexBuffer};
 use glutin::{
     config::ConfigTemplateBuilder,
     context::{ContextAttributesBuilder, NotCurrentGlContext},
     display::{GetGlDisplay, GlDisplay},
     surface::{SurfaceAttributesBuilder, WindowSurface},
 };
-use imgui::{Condition, Image, ProgressBar, TextureId, Ui};
+use imgui::{Condition, Image, MouseButton, ProgressBar, TextureId, Ui};
 use imgui_glium_renderer::{Renderer, Texture};
 use imgui_winit_support::winit::{
     dpi::LogicalSize,
@@ -19,14 +25,15 @@ use imgui_winit_support::winit::{
 };
 use raw_window_handle::HasRawWindowHandle;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use xbrdf_core::{
     BakeConfigFile, BakeMode, BakeOverrides, Manifest, MaterialKind, Mesh, ResolvedBakeConfig,
-    SamplerKind,
+    SamplerKind, Vec3,
 };
 use xbrdf_gpu::{AtlasProgressFrame, GpuBakeStats, ProgressiveBakeOptions, ProgressiveFrame};
 
@@ -46,6 +53,7 @@ fn run() -> Result<()> {
         Renderer::init(&mut imgui, &display).context("failed to initialize ImGui renderer")?;
     let mut app = AppState::new();
     let mut preview = PreviewTexture::default();
+    let mut model_preview = ModelPreviewTexture::default();
     let mut last_frame = Instant::now();
 
     event_loop
@@ -67,14 +75,25 @@ fn run() -> Result<()> {
             } => {
                 app.receive_bake_events();
                 if app.preview_dirty {
+                    app.preview_version = app.preview_version.wrapping_add(1);
                     if let Err(error) = preview.update(&display, &mut renderer, &app.preview) {
                         app.status = format!("Preview upload failed: {error:#}");
                     }
                     app.preview_dirty = false;
                 }
+                if let Err(error) = model_preview.render(
+                    &display,
+                    &mut renderer,
+                    &app.preview,
+                    &app.settings,
+                    app.selected_preview_model(),
+                    app.preview_version,
+                ) {
+                    app.status = format!("3D preview failed: {error:#}");
+                }
 
                 let ui = imgui.frame();
-                draw_ui(ui, &mut app, &preview);
+                draw_ui(ui, &mut app, &preview, &model_preview);
 
                 let mut target = display.draw();
                 target.clear_color_srgb(0.055, 0.055, 0.06, 1.0);
@@ -128,6 +147,9 @@ struct BakeSettings {
     material_color: [f32; 3],
     roughness: f32,
     update_interval_seconds: f32,
+    preview_light: [f32; 3],
+    preview_rotation: [f32; 4],
+    preview_model_index: usize,
 }
 
 impl Default for BakeSettings {
@@ -152,6 +174,9 @@ impl Default for BakeSettings {
             material_color: [1.0, 1.0, 1.0],
             roughness: 0.05,
             update_interval_seconds: 0.5,
+            preview_light: [0.0, 1.0, -1.0],
+            preview_rotation: quat_from_axis_angle([0.0, 1.0, 0.0], 0.65),
+            preview_model_index: 0,
         }
     }
 }
@@ -189,11 +214,14 @@ struct AppState {
     total_samples: u32,
     status: String,
     preview: PreviewImage,
+    latest_bake_preview: Option<PreviewImage>,
     preview_dirty: bool,
+    preview_version: u64,
     last_stats: Option<GpuBakeStats>,
     history: Vec<RenderSnapshot>,
     history_index: i32,
     follow_latest: bool,
+    preview_models: Vec<PreviewModelOption>,
 }
 
 impl Default for AppState {
@@ -207,11 +235,14 @@ impl Default for AppState {
             total_samples: 0,
             status: "Idle".to_string(),
             preview: PreviewImage::default(),
+            latest_bake_preview: None,
             preview_dirty: false,
+            preview_version: 0,
             last_stats: None,
             history: Vec::new(),
             history_index: -1,
             follow_latest: true,
+            preview_models: discover_preview_models(),
         }
     }
 }
@@ -239,6 +270,7 @@ impl AppState {
         self.completed_samples = 0;
         self.total_samples = 0;
         self.last_stats = None;
+        self.latest_bake_preview = None;
         self.status = "Starting bake".to_string();
         self.follow_latest = true;
 
@@ -262,7 +294,12 @@ impl AppState {
             match event {
                 BakeEvent::Status(status) => self.status = status,
                 BakeEvent::Started { width, height } => {
-                    self.preview = PreviewImage::new(width, height);
+                    self.preview = PreviewImage::new(
+                        width,
+                        height,
+                        PreviewMeta::from_settings(&self.settings),
+                    );
+                    self.latest_bake_preview = Some(self.preview.clone());
                     self.preview_dirty = true;
                     self.total_samples = if self.settings.bake_mode() == BakeMode::Single {
                         self.settings.samples.max(1) as u32
@@ -275,11 +312,12 @@ impl AppState {
                     self.status = "Baking".to_string();
                 }
                 BakeEvent::Frame(frame) => {
-                    let image = PreviewImage::from_frame(&frame);
+                    let image = PreviewImage::from_frame(&frame, self.preview.meta);
                     if self.follow_latest || self.history.is_empty() {
-                        self.preview = image;
+                        self.preview = image.clone();
                         self.preview_dirty = true;
                     }
+                    self.latest_bake_preview = Some(image);
                     self.completed_samples = frame.completed_samples;
                     self.total_samples = frame.total_samples;
                     self.progress = if frame.total_samples > 0 {
@@ -293,11 +331,12 @@ impl AppState {
                     );
                 }
                 BakeEvent::AtlasFrame(frame) => {
-                    let image = PreviewImage::from_atlas_frame(&frame);
+                    let image = PreviewImage::from_atlas_frame(&frame, self.preview.meta);
                     if self.follow_latest || self.history.is_empty() {
-                        self.preview = image;
+                        self.preview = image.clone();
                         self.preview_dirty = true;
                     }
+                    self.latest_bake_preview = Some(image);
                     self.completed_samples = frame.completed_tiles;
                     self.total_samples = frame.total_tiles;
                     self.progress = if frame.total_tiles > 0 {
@@ -312,7 +351,7 @@ impl AppState {
                 }
                 BakeEvent::Finished {
                     stats,
-                    image,
+                    image: image_path,
                     manifest,
                 } => {
                     self.baking = false;
@@ -325,15 +364,21 @@ impl AppState {
                     } else {
                         format!("{} light tiles", self.total_samples)
                     };
+                    let history_image = self
+                        .latest_bake_preview
+                        .take()
+                        .unwrap_or_else(|| self.preview.clone());
                     self.push_history(RenderSnapshot {
-                        image: self.preview.clone(),
+                        image: history_image,
                         label,
                     });
-                    self.status = format!("Wrote {} and {}", image.display(), manifest.display());
+                    self.status =
+                        format!("Wrote {} and {}", image_path.display(), manifest.display());
                 }
                 BakeEvent::Error(error) => {
                     self.baking = false;
                     keep_receiver = false;
+                    self.latest_bake_preview = None;
                     self.status = error;
                 }
             }
@@ -365,6 +410,72 @@ impl AppState {
         self.preview = self.history[index as usize].image.clone();
         self.preview_dirty = true;
     }
+
+    fn selected_preview_model(&self) -> &PreviewModelOption {
+        let index = self
+            .settings
+            .preview_model_index
+            .min(self.preview_models.len().saturating_sub(1));
+        &self.preview_models[index]
+    }
+
+    fn save_current_atlas(&mut self) {
+        let out_dir = PathBuf::from(self.settings.out_dir.trim());
+        if out_dir.as_os_str().is_empty() {
+            self.status = "Output directory is empty".to_string();
+            return;
+        }
+
+        let result = (|| -> Result<PathBuf> {
+            std::fs::create_dir_all(&out_dir).with_context(|| {
+                format!("failed to create output directory {}", out_dir.display())
+            })?;
+            let path = out_dir.join("xbrdf_current_atlas.exr");
+            self.preview.save_exr(&path)?;
+            Ok(path)
+        })();
+
+        match result {
+            Ok(path) => {
+                self.status = format!("Saved current atlas {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("{error:#}");
+            }
+        }
+    }
+
+    fn load_current_atlas(&mut self) {
+        let path = PathBuf::from(self.settings.out_dir.trim()).join("xbrdf_current_atlas.exr");
+        let result = PreviewImage::load_exr(&path, PreviewMeta::from_settings(&self.settings));
+
+        match result {
+            Ok(image) => {
+                self.preview = image.clone();
+                self.preview_dirty = true;
+                self.push_history(RenderSnapshot {
+                    image,
+                    label: "loaded atlas".to_string(),
+                });
+                self.status = format!("Loaded current atlas {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("{error:#}");
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PreviewModelOption {
+    label: String,
+    source: PreviewModelSource,
+}
+
+#[derive(Clone)]
+enum PreviewModelSource {
+    Torus,
+    Fbx(PathBuf),
 }
 
 enum BakeEvent {
@@ -392,28 +503,32 @@ struct RenderSnapshot {
 struct PreviewImage {
     width: u32,
     height: u32,
+    rgb: Vec<[f32; 3]>,
     rgba: Vec<u8>,
     exposure: f32,
+    meta: PreviewMeta,
 }
 
 impl PreviewImage {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, meta: PreviewMeta) -> Self {
         Self {
             width,
             height,
+            rgb: vec![[0.0; 3]; width as usize * height as usize],
             rgba: vec![0; width as usize * height as usize * 4],
             exposure: 0.0,
+            meta,
         }
     }
 
-    fn from_frame(frame: &ProgressiveFrame) -> Self {
-        let mut image = Self::new(frame.width, frame.height);
+    fn from_frame(frame: &ProgressiveFrame, meta: PreviewMeta) -> Self {
+        let mut image = Self::new(frame.width, frame.height, meta);
         image.write_frame(frame);
         image
     }
 
-    fn from_atlas_frame(frame: &AtlasProgressFrame) -> Self {
-        let mut image = Self::new(frame.width, frame.height);
+    fn from_atlas_frame(frame: &AtlasProgressFrame, meta: PreviewMeta) -> Self {
+        let mut image = Self::new(frame.width, frame.height, meta);
         image.write_pixels(&frame.pixels);
         image
     }
@@ -436,11 +551,97 @@ impl PreviewImage {
             if index * 4 + 3 >= self.rgba.len() {
                 break;
             }
+            if index < self.rgb.len() {
+                self.rgb[index] = *src;
+            }
             let dst = index * 4;
             self.rgba[dst] = to_preview_byte(src[0] * gain);
             self.rgba[dst + 1] = to_preview_byte(src[1] * gain);
             self.rgba[dst + 2] = to_preview_byte(src[2] * gain);
             self.rgba[dst + 3] = 255;
+        }
+    }
+
+    fn save_exr(&self, path: &Path) -> Result<()> {
+        if self.width == 0 || self.height == 0 || self.rgb.is_empty() {
+            anyhow::bail!("no atlas is selected");
+        }
+
+        write_rgb_file(path, self.width as usize, self.height as usize, |x, y| {
+            let pixel = self.rgb[y * self.width as usize + x];
+            (pixel[0], pixel[1], pixel[2])
+        })
+        .with_context(|| format!("failed to write EXR {}", path.display()))
+    }
+
+    fn load_exr(path: &Path, meta: PreviewMeta) -> Result<Self> {
+        let image = read_first_rgba_layer_from_file(
+            path,
+            |resolution, _channels| {
+                (
+                    resolution.0 as u32,
+                    resolution.1 as u32,
+                    vec![[0.0_f32; 3]; resolution.0 * resolution.1],
+                )
+            },
+            |pixels, position, (r, g, b, _a): (f32, f32, f32, f32)| {
+                let width = pixels.0 as usize;
+                pixels.2[position.1 * width + position.0] = [r, g, b];
+            },
+        )
+        .with_context(|| format!("failed to read EXR {}", path.display()))?;
+
+        let (width, height, rgb) = image.layer_data.channel_data.pixels;
+        let mut preview = Self::new(width, height, meta);
+        preview.write_pixels(&rgb);
+        Ok(preview)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreviewMeta {
+    mode: BakeMode,
+    camera_width: u32,
+    camera_height: u32,
+    light_width: u32,
+    light_height: u32,
+}
+
+impl Default for PreviewMeta {
+    fn default() -> Self {
+        Self {
+            mode: BakeMode::Single,
+            camera_width: 1,
+            camera_height: 1,
+            light_width: 1,
+            light_height: 1,
+        }
+    }
+}
+
+impl PreviewMeta {
+    fn from_settings(settings: &BakeSettings) -> Self {
+        let (_, _, tile_width, tile_height, _) = preview_extents(settings);
+        Self {
+            mode: settings.bake_mode(),
+            camera_width: tile_width.max(1),
+            camera_height: tile_height.max(1),
+            light_width: match settings.bake_mode() {
+                BakeMode::Single => 1,
+                BakeMode::Full | BakeMode::Isotropic => settings.light_width.max(1) as u32,
+            },
+            light_height: match settings.bake_mode() {
+                BakeMode::Single => 1,
+                BakeMode::Full | BakeMode::Isotropic => settings.light_height.max(1) as u32,
+            },
+        }
+    }
+
+    fn mode_code(self) -> i32 {
+        match self.mode {
+            BakeMode::Single => 0,
+            BakeMode::Full => 1,
+            BakeMode::Isotropic => 2,
         }
     }
 }
@@ -490,7 +691,353 @@ impl PreviewTexture {
     }
 }
 
-fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
+#[derive(Copy, Clone)]
+struct ModelVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    tangent: [f32; 3],
+    bitangent: [f32; 3],
+}
+
+glium::implement_vertex!(ModelVertex, position, normal, tangent, bitangent);
+
+struct ModelPreviewTexture {
+    id: Option<TextureId>,
+    color: Option<Rc<Texture2d>>,
+    depth: Option<DepthTexture2d>,
+    pano: Option<Texture2d>,
+    source_version: u64,
+    program: Option<Program>,
+    vertices: Option<VertexBuffer<ModelVertex>>,
+    indices: Option<IndexBuffer<u32>>,
+    model_key: Option<String>,
+    size: u32,
+}
+
+impl Default for ModelPreviewTexture {
+    fn default() -> Self {
+        Self {
+            id: None,
+            color: None,
+            depth: None,
+            pano: None,
+            source_version: u64::MAX,
+            program: None,
+            vertices: None,
+            indices: None,
+            model_key: None,
+            size: 512,
+        }
+    }
+}
+
+impl ModelPreviewTexture {
+    fn render(
+        &mut self,
+        display: &glium::Display<WindowSurface>,
+        renderer: &mut Renderer,
+        preview: &PreviewImage,
+        settings: &BakeSettings,
+        model: &PreviewModelOption,
+        preview_version: u64,
+    ) -> Result<()> {
+        if preview.width == 0 || preview.height == 0 || preview.rgba.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_resources(display, renderer, model)?;
+        if self.source_version != preview_version {
+            let raw = RawImage2d {
+                data: Cow::Borrowed(preview.rgba.as_slice()),
+                width: preview.width,
+                height: preview.height,
+                format: ClientFormat::U8U8U8U8,
+            };
+            self.pano = Some(
+                Texture2d::new(display, raw).context("failed to upload xBRDF preview texture")?,
+            );
+            self.source_version = preview_version;
+        }
+
+        let color = self
+            .color
+            .as_deref()
+            .context("missing 3D preview color texture")?;
+        let depth = self
+            .depth
+            .as_ref()
+            .context("missing 3D preview depth texture")?;
+        let pano = self
+            .pano
+            .as_ref()
+            .context("missing xBRDF preview texture")?;
+        let program = self.program.as_ref().context("missing 3D preview shader")?;
+        let vertices = self
+            .vertices
+            .as_ref()
+            .context("missing 3D preview vertices")?;
+        let indices = self
+            .indices
+            .as_ref()
+            .context("missing 3D preview indices")?;
+
+        let mut target = SimpleFrameBuffer::with_depth_buffer(display, color, depth)
+            .context("failed to create 3D preview framebuffer")?;
+        target.clear_color_and_depth((0.06, 0.065, 0.07, 1.0), 1.0);
+
+        let meta = preview.meta;
+        let light = normalize3(settings.preview_light);
+        let camera_pos = [0.0_f32, 0.6, 3.2];
+        let uniforms = uniform! {
+            model: quat_to_mat4(settings.preview_rotation),
+            view: look_at(camera_pos, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            projection: perspective(35.0_f32.to_radians(), 1.0, 0.05, 20.0),
+            camera_pos: camera_pos,
+            preview_light: light,
+            xbrdf_tex: pano.sampled()
+                .magnify_filter(MagnifySamplerFilter::Nearest)
+                .minify_filter(MinifySamplerFilter::Nearest),
+            mode: meta.mode_code(),
+            camera_width: meta.camera_width as i32,
+            camera_height: meta.camera_height as i32,
+            light_width: meta.light_width as i32,
+            light_height: meta.light_height as i32,
+        };
+
+        let draw_params = glium::DrawParameters {
+            depth: glium::Depth {
+                test: glium::draw_parameters::DepthTest::IfLess,
+                write: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        target
+            .draw(vertices, indices, program, &uniforms, &draw_params)
+            .context("failed to draw 3D preview")?;
+        Ok(())
+    }
+
+    fn ensure_resources(
+        &mut self,
+        display: &glium::Display<WindowSurface>,
+        renderer: &mut Renderer,
+        model: &PreviewModelOption,
+    ) -> Result<()> {
+        if self.color.is_none() {
+            let color = Rc::new(
+                Texture2d::empty(display, self.size, self.size)
+                    .context("failed to create 3D preview color texture")?,
+            );
+            let renderer_texture = Texture {
+                texture: color.clone(),
+                sampler: SamplerBehavior {
+                    minify_filter: MinifySamplerFilter::Linear,
+                    magnify_filter: MagnifySamplerFilter::Linear,
+                    ..Default::default()
+                },
+            };
+            self.id = Some(renderer.textures().insert(renderer_texture));
+            self.color = Some(color);
+        }
+        if self.depth.is_none() {
+            self.depth = Some(
+                DepthTexture2d::empty(display, self.size, self.size)
+                    .context("failed to create 3D preview depth texture")?,
+            );
+        }
+        if self.program.is_none() {
+            self.program = Some(
+                Program::from_source(display, MODEL_VERTEX_SHADER, MODEL_FRAGMENT_SHADER, None)
+                    .context("failed to compile 3D preview shader")?,
+            );
+        }
+        let model_key = model.key();
+        if self.model_key.as_deref() != Some(model_key.as_str()) {
+            self.vertices = None;
+            self.indices = None;
+            self.model_key = None;
+        }
+        if self.vertices.is_none() || self.indices.is_none() {
+            let (vertices, indices) = load_preview_model(model)?;
+            self.vertices = Some(
+                VertexBuffer::new(display, &vertices)
+                    .context("failed to create 3D preview vertex buffer")?,
+            );
+            self.indices = Some(
+                IndexBuffer::new(display, PrimitiveType::TrianglesList, &indices)
+                    .context("failed to create 3D preview index buffer")?,
+            );
+            self.model_key = Some(model_key);
+        }
+        Ok(())
+    }
+}
+
+impl PreviewModelOption {
+    fn key(&self) -> String {
+        match &self.source {
+            PreviewModelSource::Torus => "synthetic:torus".to_string(),
+            PreviewModelSource::Fbx(path) => path.to_string_lossy().to_string(),
+        }
+    }
+}
+
+const MODEL_VERTEX_SHADER: &str = r#"
+#version 330 core
+in vec3 position;
+in vec3 normal;
+in vec3 tangent;
+in vec3 bitangent;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+out vec3 v_position;
+out vec3 v_normal;
+out vec3 v_tangent;
+out vec3 v_bitangent;
+
+void main() {
+    vec4 world = model * vec4(position, 1.0);
+    mat3 basis = mat3(model);
+    v_position = world.xyz;
+    v_normal = normalize(basis * normal);
+    v_tangent = normalize(basis * tangent);
+    v_bitangent = normalize(basis * bitangent);
+    gl_Position = projection * view * world;
+}
+"#;
+
+const MODEL_FRAGMENT_SHADER: &str = r#"
+#version 330 core
+const float PI = 3.14159265358979323846;
+const float TAU = 6.28318530717958647692;
+const float HALF_PI = 1.57079632679489661923;
+
+in vec3 v_position;
+in vec3 v_normal;
+in vec3 v_tangent;
+in vec3 v_bitangent;
+
+uniform sampler2D xbrdf_tex;
+uniform vec3 camera_pos;
+uniform vec3 preview_light;
+uniform int mode;
+uniform int camera_width;
+uniform int camera_height;
+uniform int light_width;
+uniform int light_height;
+
+out vec4 color;
+
+vec2 dir_to_latlong(vec3 dir) {
+    dir = normalize(dir);
+    float u = atan(dir.x, dir.z) / TAU + 0.5;
+    float v = 1.0 - asin(clamp(dir.y, 0.0, 1.0)) / HALF_PI;
+    return vec2(fract(u), clamp(v, 0.0, 1.0));
+}
+
+vec4 fetch_atlas(ivec2 p) {
+    ivec2 size = textureSize(xbrdf_tex, 0);
+    p.x = ((p.x % size.x) + size.x) % size.x;
+    p.y = clamp(p.y, 0, size.y - 1);
+    return texelFetch(xbrdf_tex, p, 0);
+}
+
+vec4 sample_camera_tile(int light_x, int light_y, vec2 camera_uv) {
+    float fx = camera_uv.x * float(camera_width) - 0.5;
+    float fy = camera_uv.y * float(camera_height) - 0.5;
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    float tx = fract(fx);
+    float ty = fract(fy);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    int wx0 = ((x0 % camera_width) + camera_width) % camera_width;
+    int wx1 = ((x1 % camera_width) + camera_width) % camera_width;
+    y0 = clamp(y0, 0, camera_height - 1);
+    y1 = clamp(y1, 0, camera_height - 1);
+
+    ivec2 base = ivec2(light_x * camera_width, light_y * camera_height);
+    vec4 a = fetch_atlas(base + ivec2(wx0, y0));
+    vec4 b = fetch_atlas(base + ivec2(wx1, y0));
+    vec4 c = fetch_atlas(base + ivec2(wx0, y1));
+    vec4 d = fetch_atlas(base + ivec2(wx1, y1));
+    return mix(mix(a, b, tx), mix(c, d, tx), ty);
+}
+
+vec4 sample_iso_tile(int light_x, int light_y, float camera_v) {
+    float fy = camera_v * float(camera_height) - 0.5;
+    int y0 = clamp(int(floor(fy)), 0, camera_height - 1);
+    int y1 = clamp(y0 + 1, 0, camera_height - 1);
+    float ty = fract(fy);
+    int x = ((light_x % light_width) + light_width) % light_width;
+    int base_y = light_y * camera_height;
+    return mix(fetch_atlas(ivec2(x, base_y + y0)), fetch_atlas(ivec2(x, base_y + y1)), ty);
+}
+
+vec4 sample_light_grid(vec3 light_dir, vec2 camera_uv, bool isotropic) {
+    vec2 light_uv = dir_to_latlong(light_dir);
+    float gx = light_uv.x * float(light_width) - 0.5;
+    float gy = light_uv.y * float(light_height) - 0.5;
+    int x0 = int(floor(gx));
+    int y0 = int(floor(gy));
+    float tx = fract(gx);
+    float ty = fract(gy);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    x0 = ((x0 % light_width) + light_width) % light_width;
+    x1 = ((x1 % light_width) + light_width) % light_width;
+    y0 = clamp(y0, 0, light_height - 1);
+    y1 = clamp(y1, 0, light_height - 1);
+
+    vec4 a = isotropic ? sample_iso_tile(x0, y0, camera_uv.y) : sample_camera_tile(x0, y0, camera_uv);
+    vec4 b = isotropic ? sample_iso_tile(x1, y0, camera_uv.y) : sample_camera_tile(x1, y0, camera_uv);
+    vec4 c = isotropic ? sample_iso_tile(x0, y1, camera_uv.y) : sample_camera_tile(x0, y1, camera_uv);
+    vec4 d = isotropic ? sample_iso_tile(x1, y1, camera_uv.y) : sample_camera_tile(x1, y1, camera_uv);
+    return mix(mix(a, b, tx), mix(c, d, tx), ty);
+}
+
+void main() {
+    vec3 n = normalize(v_normal);
+    vec3 t = normalize(v_tangent);
+    vec3 b = normalize(v_bitangent);
+    vec3 wo_world = normalize(camera_pos - v_position);
+    vec3 wi_world = normalize(preview_light);
+
+    vec3 wo = normalize(vec3(dot(wo_world, t), dot(wo_world, n), dot(wo_world, b)));
+    vec3 wi = normalize(vec3(dot(wi_world, t), dot(wi_world, n), dot(wi_world, b)));
+
+    if (wo.y <= 0.0 || wi.y <= 0.0) {
+        color = vec4(0.015, 0.015, 0.017, 1.0);
+        return;
+    }
+
+    vec2 camera_uv = dir_to_latlong(wo);
+    vec4 response;
+    if (mode == 1) {
+        response = sample_light_grid(wi, camera_uv, false);
+    } else if (mode == 2) {
+        response = sample_light_grid(wi, camera_uv, true);
+    } else {
+        response = sample_camera_tile(0, 0, camera_uv);
+    }
+
+    float macro_cosine = max(wi.y, 0.0);
+    float rim = 0.08 * pow(1.0 - max(dot(n, wo_world), 0.0), 2.0);
+    color = vec4(response.rgb * macro_cosine + vec3(rim), 1.0);
+}
+"#;
+
+fn draw_ui(
+    ui: &Ui,
+    app: &mut AppState,
+    preview: &PreviewTexture,
+    model_preview: &ModelPreviewTexture,
+) {
     ui.window("Bake Settings")
         .size([390.0, 620.0], Condition::FirstUseEver)
         .position([12.0, 12.0], Condition::FirstUseEver)
@@ -546,6 +1093,22 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
             ));
 
             ui.input_float3("Light", &mut app.settings.light).build();
+            ui.input_float3("3D preview light", &mut app.settings.preview_light)
+                .build();
+            let labels: Vec<_> = app
+                .preview_models
+                .iter()
+                .map(|model| model.label.as_str())
+                .collect();
+            ui.combo_simple_string(
+                "Preview model",
+                &mut app.settings.preview_model_index,
+                &labels,
+            );
+            app.settings.preview_model_index = app
+                .settings
+                .preview_model_index
+                .min(app.preview_models.len().saturating_sub(1));
             ui.input_float("Tile width", &mut app.settings.tile_width)
                 .build();
             ui.input_float("Tile depth", &mut app.settings.tile_depth)
@@ -585,6 +1148,13 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
                     rays_per_second(stats)
                 ));
             }
+            if ui.button("Save Current Atlas") {
+                app.save_current_atlas();
+            }
+            ui.same_line();
+            if ui.button("Load Current Atlas") {
+                app.load_current_atlas();
+            }
             if ui.button("Clear History") {
                 app.history.clear();
                 app.history_index = -1;
@@ -615,6 +1185,51 @@ fn draw_ui(ui: &Ui, app: &mut AppState, preview: &PreviewTexture) {
                 ui.text("No preview yet");
             }
         });
+
+    ui.window("3D Preview")
+        .position([414.0, 450.0], Condition::FirstUseEver)
+        .size([420.0, 320.0], Condition::FirstUseEver)
+        .build(|| {
+            let available = ui.content_region_avail();
+            if let Some(id) = model_preview.id {
+                let size = available[0].min(available[1]).max(32.0);
+                draw_draggable_model_preview(ui, app, id, size);
+            } else {
+                ui.text("No 3D preview yet");
+            }
+        });
+}
+
+fn draw_draggable_model_preview(ui: &Ui, app: &mut AppState, id: TextureId, size: f32) {
+    ui.invisible_button("##model_preview_drag", [size, size]);
+    let min = ui.item_rect_min();
+    let max = ui.item_rect_max();
+    ui.get_window_draw_list()
+        .add_image(id, min, max)
+        .uv_min([0.0, 1.0])
+        .uv_max([1.0, 0.0])
+        .build();
+
+    if ui.is_item_hovered() && ui.is_mouse_dragging(MouseButton::Left) {
+        let delta = ui.io().mouse_delta;
+        let yaw = quat_from_axis_angle([0.0, 1.0, 0.0], delta[0] * 0.01);
+        let pitch = quat_from_axis_angle([1.0, 0.0, 0.0], delta[1] * 0.01);
+        app.settings.preview_rotation = normalize_quat(quat_mul(
+            pitch,
+            quat_mul(yaw, app.settings.preview_rotation),
+        ));
+    }
+
+    if ui.is_item_hovered() && ui.is_mouse_dragging(MouseButton::Right) {
+        let delta = ui.io().mouse_delta;
+        let roll = quat_from_axis_angle([0.0, 0.0, 1.0], delta[0] * 0.01);
+        app.settings.preview_rotation =
+            normalize_quat(quat_mul(roll, app.settings.preview_rotation));
+    }
+
+    if ui.is_item_hovered() && ui.is_mouse_double_clicked(MouseButton::Left) {
+        app.settings.preview_rotation = quat_from_axis_angle([0.0, 1.0, 0.0], 0.65);
+    }
 }
 
 fn progress_label(app: &AppState) -> String {
@@ -840,6 +1455,513 @@ fn preview_extents(settings: &BakeSettings) -> (u32, u32, u32, u32, u32) {
     }
 }
 
+fn discover_preview_models() -> Vec<PreviewModelOption> {
+    let mut models = vec![PreviewModelOption {
+        label: "Torus".to_string(),
+        source: PreviewModelSource::Torus,
+    }];
+
+    let preview_dir = Path::new("assets/preview");
+    if let Ok(entries) = std::fs::read_dir(preview_dir) {
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fbx"))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let label = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("FBX")
+                .to_string();
+            models.push(PreviewModelOption {
+                label,
+                source: PreviewModelSource::Fbx(path),
+            });
+        }
+    }
+
+    models
+}
+
+fn load_preview_model(model: &PreviewModelOption) -> Result<(Vec<ModelVertex>, Vec<u32>)> {
+    match &model.source {
+        PreviewModelSource::Torus => Ok(build_torus(64, 24, 0.86, 0.28)),
+        PreviewModelSource::Fbx(path) => load_preview_fbx(path)
+            .with_context(|| format!("failed to load preview model {}", path.display())),
+    }
+}
+
+fn build_torus(
+    major_segments: u32,
+    minor_segments: u32,
+    major_radius: f32,
+    minor_radius: f32,
+) -> (Vec<ModelVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity((major_segments * minor_segments) as usize);
+    let mut indices = Vec::with_capacity((major_segments * minor_segments * 6) as usize);
+
+    for i in 0..major_segments {
+        let u = i as f32 / major_segments as f32 * std::f32::consts::TAU;
+        let (su, cu) = u.sin_cos();
+        for j in 0..minor_segments {
+            let v = j as f32 / minor_segments as f32 * std::f32::consts::TAU;
+            let (sv, cv) = v.sin_cos();
+            let ring = major_radius + minor_radius * cv;
+            let normal = normalize3([cv * su, sv, cv * cu]);
+            let tangent = normalize3([cu, 0.0, -su]);
+            let bitangent = cross3(normal, tangent);
+            vertices.push(ModelVertex {
+                position: [ring * su, minor_radius * sv, ring * cu],
+                normal,
+                tangent,
+                bitangent,
+            });
+        }
+    }
+
+    for i in 0..major_segments {
+        let ni = (i + 1) % major_segments;
+        for j in 0..minor_segments {
+            let nj = (j + 1) % minor_segments;
+            let a = i * minor_segments + j;
+            let b = ni * minor_segments + j;
+            let c = ni * minor_segments + nj;
+            let d = i * minor_segments + nj;
+            indices.extend_from_slice(&[a, b, c, a, c, d]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+fn load_preview_fbx(path: &Path) -> Result<(Vec<ModelVertex>, Vec<u32>)> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let fbx = fbx::File::read_from(reader)?;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    for geometry in fbx.children.iter().flat_map(geometry_nodes) {
+        parse_preview_fbx_geometry(geometry, &mut vertices, &mut indices);
+    }
+
+    if vertices.is_empty() || indices.is_empty() {
+        anyhow::bail!("FBX contains no previewable triangle mesh");
+    }
+
+    smooth_preview_frames(&mut vertices);
+    fit_preview_vertices(&mut vertices);
+    Ok((vertices, indices))
+}
+
+fn parse_preview_fbx_geometry(
+    node: &Node,
+    vertices_out: &mut Vec<ModelVertex>,
+    indices_out: &mut Vec<u32>,
+) {
+    let Some(raw_vertices) = child_f64_array(node, "Vertices") else {
+        return;
+    };
+    let Some(polygon_indices) = child_i32_array(node, "PolygonVertexIndex") else {
+        return;
+    };
+    let positions: Vec<_> = raw_vertices
+        .chunks_exact(3)
+        .map(|chunk| Vec3::new(chunk[0] as f32, chunk[1] as f32, chunk[2] as f32))
+        .collect();
+    let uv_layer = fbx_uv_layer(node);
+    let mut polygon = Vec::new();
+    let mut polygon_vertex_start = 0usize;
+
+    for raw_index in polygon_indices {
+        let end = raw_index < 0;
+        let vertex_index = if end {
+            (-raw_index - 1) as usize
+        } else {
+            raw_index as usize
+        };
+        polygon.push(vertex_index);
+
+        if end {
+            if polygon.len() >= 3 {
+                for local in 1..polygon.len() - 1 {
+                    let tri_indices = [polygon[0], polygon[local], polygon[local + 1]];
+                    if tri_indices.iter().any(|index| *index >= positions.len()) {
+                        continue;
+                    }
+                    let tri_uvs = uv_layer.as_ref().map(|layer| {
+                        [
+                            layer.uv_at(polygon_vertex_start, &polygon, 0),
+                            layer.uv_at(polygon_vertex_start, &polygon, local),
+                            layer.uv_at(polygon_vertex_start, &polygon, local + 1),
+                        ]
+                    });
+                    push_preview_triangle(
+                        [
+                            positions[tri_indices[0]],
+                            positions[tri_indices[1]],
+                            positions[tri_indices[2]],
+                        ],
+                        tri_uvs,
+                        vertices_out,
+                        indices_out,
+                    );
+                }
+            }
+            polygon_vertex_start += polygon.len();
+            polygon.clear();
+        }
+    }
+}
+
+fn push_preview_triangle(
+    positions: [Vec3; 3],
+    uvs: Option<[[f32; 2]; 3]>,
+    vertices_out: &mut Vec<ModelVertex>,
+    indices_out: &mut Vec<u32>,
+) {
+    let e1 = positions[1] - positions[0];
+    let e2 = positions[2] - positions[0];
+    let Some(normal) = e1.cross(e2).normalize() else {
+        return;
+    };
+
+    let (tangent, bitangent) = if let Some(uvs) = uvs {
+        tangent_frame_from_uvs(e1, e2, uvs).unwrap_or_else(|| fallback_tangent_frame(normal))
+    } else {
+        fallback_tangent_frame(normal)
+    };
+
+    let base = vertices_out.len() as u32;
+    for position in positions {
+        vertices_out.push(ModelVertex {
+            position: position.to_array(),
+            normal: normal.to_array(),
+            tangent: tangent.to_array(),
+            bitangent: bitangent.to_array(),
+        });
+    }
+    indices_out.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+fn tangent_frame_from_uvs(e1: Vec3, e2: Vec3, uvs: [[f32; 2]; 3]) -> Option<(Vec3, Vec3)> {
+    let duv1 = [uvs[1][0] - uvs[0][0], uvs[1][1] - uvs[0][1]];
+    let duv2 = [uvs[2][0] - uvs[0][0], uvs[2][1] - uvs[0][1]];
+    let det = duv1[0] * duv2[1] - duv1[1] * duv2[0];
+    if det.abs() < 1.0e-8 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let tangent = ((e1 * duv2[1] - e2 * duv1[1]) * inv_det).normalize()?;
+    let bitangent = ((e2 * duv1[0] - e1 * duv2[0]) * inv_det).normalize()?;
+    Some((tangent, bitangent))
+}
+
+fn fallback_tangent_frame(normal: Vec3) -> (Vec3, Vec3) {
+    let helper = if normal.y.abs() < 0.9 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let tangent = helper
+        .cross(normal)
+        .normalize()
+        .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+    let bitangent = normal
+        .cross(tangent)
+        .normalize()
+        .unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+    (tangent, bitangent)
+}
+
+fn smooth_preview_frames(vertices: &mut [ModelVertex]) {
+    #[derive(Clone, Copy)]
+    struct Accum {
+        normal: Vec3,
+        tangent: Vec3,
+        bitangent: Vec3,
+    }
+
+    impl Default for Accum {
+        fn default() -> Self {
+            Self {
+                normal: Vec3::ZERO,
+                tangent: Vec3::ZERO,
+                bitangent: Vec3::ZERO,
+            }
+        }
+    }
+
+    let mut accum = HashMap::<[i32; 3], Accum>::new();
+    for vertex in vertices.iter() {
+        let key = smooth_position_key(vertex.position);
+        let entry = accum.entry(key).or_default();
+        entry.normal += Vec3::from_array(vertex.normal);
+        entry.tangent += Vec3::from_array(vertex.tangent);
+        entry.bitangent += Vec3::from_array(vertex.bitangent);
+    }
+
+    for vertex in vertices {
+        let Some(entry) = accum.get(&smooth_position_key(vertex.position)).copied() else {
+            continue;
+        };
+        let normal = entry
+            .normal
+            .normalize()
+            .unwrap_or_else(|| Vec3::from_array(vertex.normal));
+        let tangent_sum = entry
+            .tangent
+            .normalize()
+            .unwrap_or_else(|| Vec3::from_array(vertex.tangent));
+        let mut tangent = tangent_sum - normal * tangent_sum.dot(normal);
+        if let Some(projected) = tangent.normalize() {
+            tangent = projected;
+        } else {
+            tangent = fallback_tangent_frame(normal).0;
+        }
+
+        let handedness = normal
+            .cross(tangent)
+            .dot(entry.bitangent)
+            .signum()
+            .max(-1.0);
+        let bitangent = normal.cross(tangent) * if handedness < 0.0 { -1.0 } else { 1.0 };
+
+        vertex.normal = normal.to_array();
+        vertex.tangent = tangent.to_array();
+        vertex.bitangent = bitangent.to_array();
+    }
+}
+
+fn smooth_position_key(position: [f32; 3]) -> [i32; 3] {
+    [
+        (position[0] * 100_000.0).round() as i32,
+        (position[1] * 100_000.0).round() as i32,
+        (position[2] * 100_000.0).round() as i32,
+    ]
+}
+
+fn fit_preview_vertices(vertices: &mut [ModelVertex]) {
+    if vertices.is_empty() {
+        return;
+    }
+    let mut min = Vec3::from_array(vertices[0].position);
+    let mut max = min;
+    for vertex in vertices.iter() {
+        let position = Vec3::from_array(vertex.position);
+        min = min.min(position);
+        max = max.max(position);
+    }
+    let center = (min + max) * 0.5;
+    let extent = max - min;
+    let max_extent = extent.x.max(extent.y).max(extent.z).max(1.0e-6);
+    let scale = 1.8 / max_extent;
+    for vertex in vertices {
+        let position = (Vec3::from_array(vertex.position) - center) * scale;
+        vertex.position = position.to_array();
+    }
+}
+
+#[derive(Clone)]
+struct FbxUvLayer {
+    mapping: String,
+    reference: String,
+    uvs: Vec<[f32; 2]>,
+    indices: Vec<i32>,
+}
+
+impl FbxUvLayer {
+    fn uv_at(&self, polygon_vertex_start: usize, polygon: &[usize], local: usize) -> [f32; 2] {
+        let mapped_index = match self.mapping.as_str() {
+            "ByPolygonVertex" => polygon_vertex_start + local,
+            "ByVertice" | "ByVertex" => polygon[local],
+            _ => polygon_vertex_start + local,
+        };
+        let direct_index = if self.reference == "IndexToDirect" || self.reference == "Index" {
+            self.indices
+                .get(mapped_index)
+                .copied()
+                .unwrap_or(mapped_index as i32)
+                .max(0) as usize
+        } else {
+            mapped_index
+        };
+        self.uvs.get(direct_index).copied().unwrap_or([0.0, 0.0])
+    }
+}
+
+fn fbx_uv_layer(node: &Node) -> Option<FbxUvLayer> {
+    let layer = node
+        .children
+        .iter()
+        .find(|child| child.name == "LayerElementUV")?;
+    let mapping = child_string(layer, "MappingInformationType")
+        .unwrap_or_else(|| "ByPolygonVertex".to_string());
+    let reference =
+        child_string(layer, "ReferenceInformationType").unwrap_or_else(|| "Direct".to_string());
+    let raw_uvs = child_f64_array(layer, "UV")?;
+    let uvs = raw_uvs
+        .chunks_exact(2)
+        .map(|chunk| [chunk[0] as f32, chunk[1] as f32])
+        .collect();
+    let indices = child_i32_array(layer, "UVIndex").unwrap_or_default();
+
+    Some(FbxUvLayer {
+        mapping,
+        reference,
+        uvs,
+        indices,
+    })
+}
+
+fn geometry_nodes<'a>(node: &'a Node) -> Vec<&'a Node> {
+    let mut nodes = Vec::new();
+    collect_geometry_nodes(node, &mut nodes);
+    nodes
+}
+
+fn collect_geometry_nodes<'a>(node: &'a Node, nodes: &mut Vec<&'a Node>) {
+    if node.name == "Geometry" {
+        nodes.push(node);
+    }
+    for child in &node.children {
+        collect_geometry_nodes(child, nodes);
+    }
+}
+
+fn child_f64_array(node: &Node, name: &str) -> Option<Vec<f64>> {
+    node.children
+        .iter()
+        .find(|child| child.name == name)
+        .and_then(|child| match child.properties.first()? {
+            Property::F64Array(values) => Some(values.clone()),
+            Property::F32Array(values) => Some(values.iter().map(|value| *value as f64).collect()),
+            _ => None,
+        })
+}
+
+fn child_i32_array(node: &Node, name: &str) -> Option<Vec<i32>> {
+    node.children
+        .iter()
+        .find(|child| child.name == name)
+        .and_then(|child| match child.properties.first()? {
+            Property::I32Array(values) => Some(values.clone()),
+            _ => None,
+        })
+}
+
+fn child_string(node: &Node, name: &str) -> Option<String> {
+    node.children
+        .iter()
+        .find(|child| child.name == name)
+        .and_then(|child| match child.properties.first()? {
+            Property::String(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn quat_from_axis_angle(axis: [f32; 3], angle: f32) -> [f32; 4] {
+    let axis = normalize3(axis);
+    let half = angle * 0.5;
+    let (s, c) = half.sin_cos();
+    [axis[0] * s, axis[1] * s, axis[2] * s, c]
+}
+
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn normalize_quat(q: [f32; 4]) -> [f32; 4] {
+    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if len > 1.0e-6 && len.is_finite() {
+        [q[0] / len, q[1] / len, q[2] / len, q[3] / len]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn quat_to_mat4(q: [f32; 4]) -> [[f32; 4]; 4] {
+    let q = normalize_quat(q);
+    let x = q[0];
+    let y = q[1];
+    let z = q[2];
+    let w = q[3];
+    let xx = x * x;
+    let yy = y * y;
+    let zz = z * z;
+    let xy = x * y;
+    let xz = x * z;
+    let yz = y * z;
+    let wx = w * x;
+    let wy = w * y;
+    let wz = w * z;
+
+    [
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy), 0.0],
+        [2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx), 0.0],
+        [2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy), 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+    let f = 1.0 / (0.5 * fov_y).tan();
+    [
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, (far + near) / (near - far), -1.0],
+        [0.0, 0.0, (2.0 * far * near) / (near - far), 0.0],
+    ]
+}
+
+fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
+    let f = normalize3(sub3(center, eye));
+    let s = normalize3(cross3(f, up));
+    let u = cross3(s, f);
+    [
+        [s[0], u[0], -f[0], 0.0],
+        [s[1], u[1], -f[1], 0.0],
+        [s[2], u[2], -f[2], 0.0],
+        [-dot3(s, eye), -dot3(u, eye), dot3(f, eye), 1.0],
+    ]
+}
+
+fn normalize3(value: [f32; 3]) -> [f32; 3] {
+    let len = dot3(value, value).sqrt();
+    if len > 1.0e-6 && len.is_finite() {
+        [value[0] / len, value[1] / len, value[2] / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
 fn load_config_into_settings(settings: &mut BakeSettings) -> Result<()> {
     let path = trimmed_path(&settings.config_path).context("config path is empty")?;
     let config = BakeConfigFile::read(&path)
@@ -865,6 +1987,7 @@ fn load_config_into_settings(settings: &mut BakeSettings) -> Result<()> {
     };
     settings.enable_shadows = config.enable_shadows;
     settings.light = config.light;
+    settings.preview_light = config.light;
     settings.tile_width = config.tile_width_override.unwrap_or(0.0);
     settings.tile_depth = config.tile_depth_override.unwrap_or(0.0);
     settings.material_index = match config.material.kind {
@@ -979,5 +2102,23 @@ fn format_duration(duration: Duration) -> String {
         format!("{seconds:.3}s")
     } else {
         format!("{:.2}ms", seconds * 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_pig_fbx_loads_when_present() {
+        let path = Path::new("assets/preview/pig.fbx");
+        if !path.exists() {
+            return;
+        }
+
+        let (vertices, indices) = load_preview_fbx(path).unwrap();
+        assert!(!vertices.is_empty());
+        assert!(!indices.is_empty());
+        assert_eq!(indices.len() % 3, 0);
     }
 }

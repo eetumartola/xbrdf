@@ -1,3 +1,5 @@
 /target/
 /out/
+/assets/backup/
+*.zip
 *.exr
