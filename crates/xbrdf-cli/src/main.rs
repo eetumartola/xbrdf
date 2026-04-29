@@ -42,10 +42,6 @@ struct BakeArgs {
     light_height: Option<u32>,
     #[arg(long)]
     samples: Option<u32>,
-    #[arg(long)]
-    tile_width: Option<f32>,
-    #[arg(long)]
-    tile_depth: Option<f32>,
     #[arg(long, value_parser = parse_vec3)]
     light: Option<[f32; 3]>,
     #[arg(long)]
@@ -92,8 +88,6 @@ fn bake(args: BakeArgs) -> Result<()> {
                 light_width: args.light_width,
                 light_height: args.light_height,
                 samples: args.samples,
-                tile_width: args.tile_width,
-                tile_depth: args.tile_depth,
                 light: args.light,
                 max_repeat_radius: args.max_repeat_radius,
                 sampler: args.sampler,
@@ -107,12 +101,8 @@ fn bake(args: BakeArgs) -> Result<()> {
     let config_time = config_start.elapsed();
 
     let load_start = Instant::now();
-    let mesh = Mesh::load(
-        &resolved.obj,
-        resolved.tile_width_override,
-        resolved.tile_depth_override,
-    )
-    .with_context(|| format!("failed to load OBJ {}", resolved.obj.display()))?;
+    let mesh = Mesh::load(&resolved.obj)
+        .with_context(|| format!("failed to load geometry {}", resolved.obj.display()))?;
     let load_time = load_start.elapsed();
 
     let out = args

@@ -141,8 +141,6 @@ struct BakeSettings {
     sampler_index: usize,
     enable_shadows: bool,
     light: [f32; 3],
-    tile_width: f32,
-    tile_depth: f32,
     material_index: usize,
     material_color: [f32; 3],
     roughness: f32,
@@ -168,8 +166,6 @@ impl Default for BakeSettings {
             sampler_index: 0,
             enable_shadows: true,
             light: [0.0, 1.0, -1.0],
-            tile_width: 0.0,
-            tile_depth: 0.0,
             material_index: 0,
             material_color: [1.0, 1.0, 1.0],
             roughness: 0.05,
@@ -263,7 +259,7 @@ impl AppState {
         }
 
         let settings = self.settings.clone();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(2);
         self.receiver = Some(receiver);
         self.baking = true;
         self.progress = 0.0;
@@ -1001,12 +997,39 @@ vec4 sample_light_grid(vec3 light_dir, vec2 camera_uv, bool isotropic) {
     return mix(mix(a, b, tx), mix(c, d, tx), ty);
 }
 
+vec3 stable_perpendicular(vec3 n) {
+    vec3 helper = abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    return normalize(cross(helper, n));
+}
+
 void main() {
     vec3 n = normalize(v_normal);
     vec3 t = normalize(v_tangent);
     vec3 b = normalize(v_bitangent);
     vec3 wo_world = normalize(camera_pos - v_position);
     vec3 wi_world = normalize(preview_light);
+
+    if (mode == 2) {
+        float wo_y = dot(wo_world, n);
+        float wi_y = dot(wi_world, n);
+        if (wo_y <= 0.0 || wi_y <= 0.0) {
+            color = vec4(0.015, 0.015, 0.017, 1.0);
+            return;
+        }
+
+        vec3 view_projected = wo_world - n * wo_y;
+        vec3 iso_z = dot(view_projected, view_projected) > 1.0e-8
+            ? normalize(view_projected)
+            : stable_perpendicular(n);
+        vec3 iso_x = normalize(cross(iso_z, n));
+        vec3 wi = normalize(vec3(dot(wi_world, iso_x), wi_y, dot(wi_world, iso_z)));
+
+        vec2 camera_uv = vec2(0.5, 1.0 - asin(clamp(wo_y, 0.0, 1.0)) / HALF_PI);
+        vec4 response = sample_light_grid(wi, camera_uv, true);
+        float rim = 0.08 * pow(1.0 - max(dot(n, wo_world), 0.0), 2.0);
+        color = vec4(response.rgb * max(wi_y, 0.0) + vec3(rim), 1.0);
+        return;
+    }
 
     vec3 wo = normalize(vec3(dot(wo_world, t), dot(wo_world, n), dot(wo_world, b)));
     vec3 wi = normalize(vec3(dot(wi_world, t), dot(wi_world, n), dot(wi_world, b)));
@@ -1020,8 +1043,6 @@ void main() {
     vec4 response;
     if (mode == 1) {
         response = sample_light_grid(wi, camera_uv, false);
-    } else if (mode == 2) {
-        response = sample_light_grid(wi, camera_uv, true);
     } else {
         response = sample_camera_tile(0, 0, camera_uv);
     }
@@ -1093,8 +1114,6 @@ fn draw_ui(
             ));
 
             ui.input_float3("Light", &mut app.settings.light).build();
-            ui.input_float3("3D preview light", &mut app.settings.preview_light)
-                .build();
             let labels: Vec<_> = app
                 .preview_models
                 .iter()
@@ -1109,10 +1128,6 @@ fn draw_ui(
                 .settings
                 .preview_model_index
                 .min(app.preview_models.len().saturating_sub(1));
-            ui.input_float("Tile width", &mut app.settings.tile_width)
-                .build();
-            ui.input_float("Tile depth", &mut app.settings.tile_depth)
-                .build();
             ui.separator();
 
             ui.combo_simple_string(
@@ -1180,7 +1195,7 @@ fn draw_ui(
                     width = height * image_aspect;
                 }
                 Image::new(id, [width, height]).build(ui);
-                draw_history_controls(ui, app, width);
+                draw_history_controls(ui, app, available_width);
             } else {
                 ui.text("No preview yet");
             }
@@ -1190,6 +1205,10 @@ fn draw_ui(
         .position([414.0, 450.0], Condition::FirstUseEver)
         .size([420.0, 320.0], Condition::FirstUseEver)
         .build(|| {
+            ui.set_next_item_width(-1.0);
+            ui.slider_config("Light", -1.0, 1.0)
+                .display_format("%.3f")
+                .build_array(&mut app.settings.preview_light);
             let available = ui.content_region_avail();
             if let Some(id) = model_preview.id {
                 let size = available[0].min(available[1]).max(32.0);
@@ -1327,12 +1346,8 @@ where
     }
 
     send(BakeEvent::Status("Loading geometry".to_string()));
-    let mesh = Mesh::load(
-        &config.obj,
-        config.tile_width_override,
-        config.tile_depth_override,
-    )
-    .with_context(|| format!("failed to load geometry {}", config.obj.display()))?;
+    let mesh = Mesh::load(&config.obj)
+        .with_context(|| format!("failed to load geometry {}", config.obj.display()))?;
 
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("failed to create output directory {}", out_dir.display()))?;
@@ -1416,8 +1431,6 @@ fn resolve_settings(settings: &BakeSettings) -> Result<ResolvedBakeConfig> {
                 light_width: Some(settings.light_width.max(1) as u32),
                 light_height: Some(settings.light_height.max(1) as u32),
                 samples: Some(settings.samples.max(1) as u32),
-                tile_width: positive_override(settings.tile_width),
-                tile_depth: positive_override(settings.tile_depth),
                 light: Some(settings.light),
                 max_repeat_radius: Some(settings.max_repeat_radius.clamp(0, 16) as u32),
                 sampler: Some(settings.sampler_kind()),
@@ -1988,8 +2001,6 @@ fn load_config_into_settings(settings: &mut BakeSettings) -> Result<()> {
     settings.enable_shadows = config.enable_shadows;
     settings.light = config.light;
     settings.preview_light = config.light;
-    settings.tile_width = config.tile_width_override.unwrap_or(0.0);
-    settings.tile_depth = config.tile_depth_override.unwrap_or(0.0);
     settings.material_index = match config.material.kind {
         MaterialKind::Lambertian => 0,
         MaterialKind::SpecularPhong => 1,
@@ -2077,10 +2088,6 @@ fn resolve_gui_override_path(path: PathBuf) -> PathBuf {
 
 fn path_to_gui_string(path: &PathBuf) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn positive_override(value: f32) -> Option<f32> {
-    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 fn to_preview_byte(value: f32) -> u8 {

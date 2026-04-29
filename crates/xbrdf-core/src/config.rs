@@ -28,8 +28,6 @@ pub struct BakeConfigFile {
     pub light_width: Option<u32>,
     pub light_height: Option<u32>,
     pub samples: Option<u32>,
-    pub tile_width: Option<f32>,
-    pub tile_depth: Option<f32>,
     pub light: Option<[f32; 3]>,
     pub max_repeat_radius: Option<u32>,
     pub sampler: Option<SamplerKind>,
@@ -54,8 +52,6 @@ pub struct BakeOverrides {
     pub light_width: Option<u32>,
     pub light_height: Option<u32>,
     pub samples: Option<u32>,
-    pub tile_width: Option<f32>,
-    pub tile_depth: Option<f32>,
     pub light: Option<[f32; 3]>,
     pub max_repeat_radius: Option<u32>,
     pub sampler: Option<SamplerKind>,
@@ -74,8 +70,6 @@ pub struct ResolvedBakeConfig {
     pub light_width: u32,
     pub light_height: u32,
     pub samples: u32,
-    pub tile_width_override: Option<f32>,
-    pub tile_depth_override: Option<f32>,
     pub light: [f32; 3],
     pub max_repeat_radius: u32,
     pub sampler: SamplerKind,
@@ -209,8 +203,6 @@ pub enum ConfigError {
     InvalidResolution,
     #[error("samples must be greater than zero")]
     InvalidSamples,
-    #[error("tile width and depth overrides must be finite and greater than zero")]
-    InvalidTileOverride,
     #[error("light direction must be finite, non-zero, and above the +Y macro plane")]
     InvalidLight,
     #[error("max_repeat_radius must be in the 0..=16 range")]
@@ -450,14 +442,6 @@ impl BakeConfigFile {
             return Err(ConfigError::InvalidSamples);
         }
 
-        let tile_width_override = overrides.tile_width.or(self.tile_width);
-        let tile_depth_override = overrides.tile_depth.or(self.tile_depth);
-        if !valid_positive_override(tile_width_override)
-            || !valid_positive_override(tile_depth_override)
-        {
-            return Err(ConfigError::InvalidTileOverride);
-        }
-
         let light_value = overrides.light.or(self.light).unwrap_or(DEFAULT_LIGHT);
         let light = Vec3::from_array(light_value)
             .normalize()
@@ -481,8 +465,6 @@ impl BakeConfigFile {
             light_width,
             light_height,
             samples,
-            tile_width_override,
-            tile_depth_override,
             light,
             max_repeat_radius,
             sampler: overrides
@@ -579,12 +561,6 @@ fn resolve_path(config_dir: Option<&Path>, path: PathBuf) -> PathBuf {
     }
 }
 
-fn valid_positive_override(value: Option<f32>) -> bool {
-    value
-        .map(|value| value.is_finite() && value > 0.0)
-        .unwrap_or(true)
-}
-
 fn resolve_material(
     material: MaterialConfigFile,
     overrides: &BakeOverrides,
@@ -636,8 +612,6 @@ mod tests {
             light_width: None,
             light_height: None,
             samples: Some(2),
-            tile_width: None,
-            tile_depth: None,
             light: None,
             max_repeat_radius: None,
             sampler: None,
@@ -698,8 +672,6 @@ mod tests {
             light_width: 4,
             light_height: 3,
             samples: 1,
-            tile_width_override: None,
-            tile_depth_override: None,
             light: [0.0, 1.0, 0.0],
             max_repeat_radius: DEFAULT_MAX_REPEAT_RADIUS,
             sampler: SamplerKind::Halton,
@@ -754,8 +726,6 @@ mod tests {
             light_width: DEFAULT_LIGHT_WIDTH,
             light_height: DEFAULT_LIGHT_HEIGHT,
             samples: 1,
-            tile_width_override: None,
-            tile_depth_override: None,
             light: [0.0, 1.0, 0.0],
             max_repeat_radius: DEFAULT_MAX_REPEAT_RADIUS,
             sampler: SamplerKind::Halton,

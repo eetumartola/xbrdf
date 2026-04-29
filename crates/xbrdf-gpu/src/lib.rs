@@ -14,6 +14,7 @@ const SAMPLE_PARALLEL_LANES: u32 = 128;
 const SAMPLE_PARALLEL_SAMPLES_PER_LANE: u32 = 64;
 const HIGH_SAMPLE_PARALLEL_SAMPLES_PER_LANE: u32 = 512;
 const HIGH_SAMPLE_THRESHOLD: u32 = 65_536;
+const MAX_SAMPLE_PARALLEL_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
 const SAH_BINS: usize = 12;
 
 #[derive(Debug, thiserror::Error)]
@@ -280,6 +281,7 @@ fn sample_parallel_params(
     triangle_count: usize,
     node_count: usize,
     samples_per_lane: u32,
+    sample_lanes: u32,
     tile_min: [f32; 2],
     tile_size: [f32; 2],
     bounds_min: [f32; 4],
@@ -299,7 +301,7 @@ fn sample_parallel_params(
         sample_offset: 0,
         target_samples: config.samples,
         sample_limit: config.samples,
-        sample_lanes: SAMPLE_PARALLEL_LANES,
+        sample_lanes,
         tile_min,
         tile_size,
         bounds_min,
@@ -340,6 +342,7 @@ struct SampleParallelContext {
     output_buffer: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    sample_lanes: u32,
     samples_per_lane: u32,
     tile_min: [f32; 2],
     tile_size: [f32; 2],
@@ -377,6 +380,8 @@ impl SampleParallelContext {
             )
             .await?;
 
+        let pixel_count = config.width as u64 * config.height as u64;
+        let sample_lanes = sample_parallel_lanes_for_pixel_count(pixel_count);
         let samples_per_lane = sample_parallel_samples_per_lane(config.samples);
         let tile_min = [mesh.tile_min_x, mesh.tile_min_z];
         let tile_size = [mesh.tile_width, mesh.tile_depth];
@@ -388,6 +393,7 @@ impl SampleParallelContext {
             triangles.len(),
             bvh_nodes.len(),
             samples_per_lane,
+            sample_lanes,
             tile_min,
             tile_size,
             bounds_min,
@@ -411,8 +417,7 @@ impl SampleParallelContext {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let pixel_count = config.width as u64 * config.height as u64;
-        let partial_count = pixel_count * SAMPLE_PARALLEL_LANES as u64;
+        let partial_count = pixel_count * sample_lanes as u64;
         let output_size = partial_count * std::mem::size_of::<[f32; 4]>() as u64;
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("xbrdf sample-parallel partials"),
@@ -490,6 +495,7 @@ impl SampleParallelContext {
             output_buffer,
             pipeline,
             bind_group,
+            sample_lanes,
             samples_per_lane,
             tile_min,
             tile_size,
@@ -507,13 +513,13 @@ impl SampleParallelContext {
         let mut dispatch_count = 0u32;
         let mut readback_time = Duration::ZERO;
         let dispatch_start = Instant::now();
-        let samples_per_wave = SAMPLE_PARALLEL_LANES * self.samples_per_lane;
+        let samples_per_wave = self.sample_lanes * self.samples_per_lane;
 
         while completed_samples < config.samples {
             let remaining = config.samples - completed_samples;
             let active_lanes = remaining
                 .div_ceil(self.samples_per_lane)
-                .min(SAMPLE_PARALLEL_LANES)
+                .min(self.sample_lanes)
                 .max(1);
             let params = GpuParams {
                 sample_offset: completed_samples,
@@ -524,6 +530,7 @@ impl SampleParallelContext {
                     self.triangles_len,
                     self.bvh_nodes_len,
                     self.samples_per_lane,
+                    self.sample_lanes,
                     self.tile_min,
                     self.tile_size,
                     self.bounds_min,
@@ -621,7 +628,7 @@ impl SampleParallelContext {
                 max_repeat_radius: config.max_repeat_radius,
                 rows_per_dispatch: config.height,
                 dispatch_count,
-                sample_lanes: SAMPLE_PARALLEL_LANES,
+                sample_lanes: self.sample_lanes,
                 samples_per_lane: self.samples_per_lane,
                 camera_ray_count,
                 max_periodic_copies_per_ray,
@@ -639,266 +646,9 @@ async fn bake_sample_parallel(
     config: &ResolvedBakeConfig,
     mesh: &Mesh,
 ) -> Result<GpuBakeResult, GpuBakeError> {
-    let total_start = Instant::now();
-    let (triangles, bvh_nodes) = build_bvh(&mesh.triangles);
-    let bvh_build_time = total_start.elapsed();
-
-    let gpu_setup_start = Instant::now();
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        })
-        .await
-        .ok_or(GpuBakeError::NoAdapter)?;
-
-    let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("xbrdf sample-parallel device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-            },
-            None,
-        )
-        .await?;
-
-    let samples_per_lane = sample_parallel_samples_per_lane(config.samples);
-    let light = Vec3::from_array(config.light);
-    let base_params = GpuParams {
-        width: config.width,
-        height: config.height,
-        samples: samples_per_lane,
-        triangle_count: triangles.len() as u32,
-        node_count: bvh_nodes.len() as u32,
-        max_repeat_radius: config.max_repeat_radius,
-        y_offset: 0,
-        active_height: config.height,
-        sample_offset: 0,
-        target_samples: config.samples,
-        sample_limit: config.samples,
-        sample_lanes: SAMPLE_PARALLEL_LANES,
-        tile_min: [mesh.tile_min_x, mesh.tile_min_z],
-        tile_size: [mesh.tile_width, mesh.tile_depth],
-        bounds_min: vec4(mesh.bounds.min),
-        bounds_max: vec4(mesh.bounds.max),
-        light_dir: vec4(light),
-        material_color: [
-            config.material.color[0],
-            config.material.color[1],
-            config.material.color[2],
-            0.0,
-        ],
-        material_kind: [
-            match config.material.kind {
-                MaterialKind::Lambertian => 0,
-                MaterialKind::SpecularPhong => 1,
-            },
-            sampler_code(config.sampler),
-            u32::from(config.enable_shadows),
-            0,
-        ],
-        material_params: [
-            1.0 / light.y.max(1.0e-4),
-            ((mesh.bounds.max.y - mesh.bounds.min.y).abs() * 0.01).max(1.0e-3),
-            config.material.roughness.unwrap_or(0.0),
-            config.material.phong_exponent().unwrap_or(1.0),
-        ],
-    };
-
-    let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("xbrdf sample-parallel triangles"),
-        contents: bytemuck::cast_slice(&triangles),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("xbrdf sample-parallel bvh"),
-        contents: bytemuck::cast_slice(&bvh_nodes),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("xbrdf sample-parallel params"),
-        contents: bytemuck::bytes_of(&base_params),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    let pixel_count = config.width as u64 * config.height as u64;
-    let partial_count = pixel_count * SAMPLE_PARALLEL_LANES as u64;
-    let samples_per_wave = SAMPLE_PARALLEL_LANES * samples_per_lane;
-    let output_size = partial_count * std::mem::size_of::<[f32; 4]>() as u64;
-    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("xbrdf sample-parallel partials"),
-        size: output_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("xbrdf sample-parallel bake shader"),
-        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-    });
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("xbrdf sample-parallel bind group layout"),
-        entries: &[
-            storage_entry(0, true),
-            storage_entry(1, true),
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            storage_entry(3, false),
-        ],
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("xbrdf sample-parallel pipeline layout"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("xbrdf sample-parallel bake pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: "main",
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("xbrdf sample-parallel bind group"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: triangle_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: bvh_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: params_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: output_buffer.as_entire_binding(),
-            },
-        ],
-    });
-    let gpu_setup_time = gpu_setup_start.elapsed();
-
-    let mut sums = vec![[0.0f32; 3]; pixel_count as usize];
-    let mut completed_samples = 0u32;
-    let mut dispatch_count = 0u32;
-    let mut readback_time = Duration::ZERO;
-    let dispatch_start = Instant::now();
-
-    while completed_samples < config.samples {
-        let remaining = config.samples - completed_samples;
-        let active_lanes = remaining
-            .div_ceil(samples_per_lane)
-            .min(SAMPLE_PARALLEL_LANES)
-            .max(1);
-        let params = GpuParams {
-            sample_offset: completed_samples,
-            sample_limit: (completed_samples + samples_per_wave).min(config.samples),
-            sample_lanes: active_lanes,
-            ..base_params
-        };
-        queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("xbrdf sample-parallel bake encoder"),
-        });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("xbrdf sample-parallel bake pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(
-                config.width.div_ceil(WORKGROUP_WIDTH),
-                config.height.div_ceil(WORKGROUP_HEIGHT),
-                active_lanes,
-            );
-        }
-        queue.submit(Some(encoder.finish()));
-        device.poll(wgpu::Maintain::Wait);
-        dispatch_count += 1;
-
-        let readback_start = Instant::now();
-        let partials = read_output_rgba(
-            &device,
-            &queue,
-            &output_buffer,
-            active_lanes as u64 * pixel_count,
-        )?;
-        readback_time += readback_start.elapsed();
-
-        for lane in 0..active_lanes as usize {
-            let lane_start = lane * pixel_count as usize;
-            for (pixel_index, sum) in sums.iter_mut().enumerate() {
-                let partial = partials[lane_start + pixel_index];
-                sum[0] += partial[0];
-                sum[1] += partial[1];
-                sum[2] += partial[2];
-            }
-        }
-
-        completed_samples = completed_samples
-            .saturating_add(samples_per_wave)
-            .min(config.samples);
-    }
-
-    let gpu_dispatch_time = dispatch_start.elapsed().saturating_sub(readback_time);
-    let inv_samples = 1.0 / config.samples as f32;
-    let pixels = sums
-        .into_iter()
-        .map(|sum| {
-            [
-                sum[0] * inv_samples,
-                sum[1] * inv_samples,
-                sum[2] * inv_samples,
-            ]
-        })
-        .collect();
-
-    let max_periodic_copies_per_axis = config.max_repeat_radius as u64 * 2 + 1;
-    let max_periodic_copies_per_ray = max_periodic_copies_per_axis * max_periodic_copies_per_axis;
-    let camera_ray_count = config.width as u64 * config.height as u64 * config.samples as u64;
-    let trace_multiplier = if config.enable_shadows { 2 } else { 1 };
-
-    Ok(GpuBakeResult {
-        pixels,
-        stats: GpuBakeStats {
-            triangle_count: triangles.len(),
-            bvh_node_count: bvh_nodes.len(),
-            width: config.width,
-            height: config.height,
-            samples: config.samples,
-            max_repeat_radius: config.max_repeat_radius,
-            rows_per_dispatch: config.height,
-            dispatch_count,
-            sample_lanes: SAMPLE_PARALLEL_LANES,
-            samples_per_lane,
-            camera_ray_count,
-            max_periodic_copies_per_ray,
-            max_bvh_traces: camera_ray_count * max_periodic_copies_per_ray * trace_multiplier,
-            bvh_build_time,
-            gpu_setup_time,
-            gpu_dispatch_time,
-            readback_time,
-        },
-    })
+    let mut context = SampleParallelContext::new(config, mesh).await?;
+    context.bake(config)
 }
-
 async fn bake_progressive_inner(
     config: &ResolvedBakeConfig,
     mesh: &Mesh,
@@ -990,8 +740,9 @@ async fn bake_progressive_inner(
     });
 
     let pixel_count = config.width as u64 * config.height as u64;
+    let max_sample_lanes = sample_parallel_lanes_for_pixel_count(pixel_count);
     let output_size =
-        pixel_count * SAMPLE_PARALLEL_LANES as u64 * std::mem::size_of::<[f32; 4]>() as u64;
+        pixel_count * max_sample_lanes as u64 * std::mem::size_of::<[f32; 4]>() as u64;
     let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("xbrdf progressive output"),
         size: output_size,
@@ -1076,7 +827,7 @@ async fn bake_progressive_inner(
             active_batch,
             config.max_repeat_radius,
         );
-        let active_lanes = sample_lanes_for(active_batch);
+        let active_lanes = sample_lanes_for(active_batch).min(max_sample_lanes);
         let samples_per_lane = active_batch.div_ceil(active_lanes).max(1);
         let batch_start = Instant::now();
         let mut y_offset = 0;
@@ -1609,13 +1360,14 @@ fn build_bvh_node(
 
     let (centroid_min, centroid_max) = centroid_bounds(triangles);
     let mid = if let Some((axis, mid)) = sah_split(triangles, centroid_min, centroid_max) {
-        sort_by_bin(triangles, centroid_min, centroid_max, axis);
         let mid = mid.min(triangles.len() - 1).max(1);
+        partition_by_bin(triangles, centroid_min, centroid_max, axis, mid);
         mid
     } else {
         let axis = longest_axis(centroid_max - centroid_min);
-        triangles.sort_by(|a, b| compare_axis(a.centroid, b.centroid, axis));
-        triangles.len() / 2
+        let mid = triangles.len() / 2;
+        triangles.select_nth_unstable_by(mid, |a, b| compare_axis(a.centroid, b.centroid, axis));
+        mid
     };
     let (left_items, right_items) = triangles.split_at_mut(mid);
     let left = build_bvh_node(left_items, ordered_triangles, nodes);
@@ -1730,14 +1482,18 @@ fn sah_split(
     }
 }
 
-fn sort_by_bin(
+fn partition_by_bin(
     triangles: &mut [BuildTriangle],
     centroid_min: Vec3,
     centroid_max: Vec3,
     axis: usize,
+    mid: usize,
 ) {
-    triangles
-        .sort_by_key(|triangle| centroid_bin(triangle.centroid, centroid_min, centroid_max, axis));
+    if mid < triangles.len() {
+        triangles.select_nth_unstable_by_key(mid, |triangle| {
+            centroid_bin(triangle.centroid, centroid_min, centroid_max, axis)
+        });
+    }
 }
 
 fn centroid_bin(centroid: Vec3, centroid_min: Vec3, centroid_max: Vec3, axis: usize) -> usize {
@@ -1855,6 +1611,14 @@ fn sample_lanes_for(sample_count: u32) -> u32 {
     sample_count
         .div_ceil(SAMPLE_PARALLEL_SAMPLES_PER_LANE)
         .clamp(1, SAMPLE_PARALLEL_LANES)
+}
+
+fn sample_parallel_lanes_for_pixel_count(pixel_count: u64) -> u32 {
+    let bytes_per_lane = pixel_count.max(1) * std::mem::size_of::<[f32; 4]>() as u64;
+    let lanes = (MAX_SAMPLE_PARALLEL_BUFFER_BYTES / bytes_per_lane)
+        .max(1)
+        .min(SAMPLE_PARALLEL_LANES as u64);
+    lanes as u32
 }
 
 fn sample_parallel_samples_per_lane(sample_count: u32) -> u32 {

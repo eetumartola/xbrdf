@@ -69,9 +69,7 @@ pub enum GeometryError {
     NonFinitePosition,
     #[error("OBJ contains a degenerate triangle")]
     DegenerateTriangle,
-    #[error(
-        "tile size must be non-zero in X and Z; provide --tile-width/--tile-depth for flat bounds"
-    )]
+    #[error("tile size must be non-zero in X and Z; geometry bounds are used as the tile period")]
     InvalidTileSize,
 }
 
@@ -94,28 +92,20 @@ impl Bounds {
 }
 
 impl Mesh {
-    pub fn load(
-        path: &Path,
-        tile_width_override: Option<f32>,
-        tile_depth_override: Option<f32>,
-    ) -> Result<Self, GeometryError> {
+    pub fn load(path: &Path) -> Result<Self, GeometryError> {
         match path
             .extension()
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("obj") => Self::load_obj(path, tile_width_override, tile_depth_override),
-            Some("fbx") => Self::load_fbx(path, tile_width_override, tile_depth_override),
+            Some("obj") => Self::load_obj(path),
+            Some("fbx") => Self::load_fbx(path),
             _ => Err(GeometryError::UnsupportedExtension(path.to_path_buf())),
         }
     }
 
-    pub fn load_obj(
-        path: &Path,
-        tile_width_override: Option<f32>,
-        tile_depth_override: Option<f32>,
-    ) -> Result<Self, GeometryError> {
+    pub fn load_obj(path: &Path) -> Result<Self, GeometryError> {
         let options = tobj::LoadOptions {
             triangulate: true,
             single_index: true,
@@ -135,8 +125,8 @@ impl Mesh {
         for model in models {
             let mesh = model.mesh;
             let base_index = positions.len();
-            for index in mesh.positions.chunks_exact(3) {
-                let position = Vec3::new(index[0], index[1], index[2]);
+            for coords in mesh.positions.chunks_exact(3) {
+                let position = Vec3::new(coords[0], coords[1], coords[2]);
                 if !position.is_finite() {
                     return Err(GeometryError::NonFinitePosition);
                 }
@@ -180,20 +170,10 @@ impl Mesh {
             }
         }
 
-        Self::from_positions_and_faces(
-            positions,
-            indexed_faces,
-            tile_width_override,
-            tile_depth_override,
-            color_source,
-        )
+        Self::from_positions_and_faces(positions, indexed_faces, color_source)
     }
 
-    pub fn load_fbx(
-        path: &Path,
-        tile_width_override: Option<f32>,
-        tile_depth_override: Option<f32>,
-    ) -> Result<Self, GeometryError> {
+    pub fn load_fbx(path: &Path) -> Result<Self, GeometryError> {
         let file = std::fs::File::open(path).map_err(|source| GeometryError::LoadFbx {
             path: path.to_path_buf(),
             source: fbx::Error::Io(source),
@@ -226,20 +206,12 @@ impl Mesh {
             }));
         }
 
-        Self::from_positions_and_faces(
-            all_positions,
-            all_faces,
-            tile_width_override,
-            tile_depth_override,
-            color_source,
-        )
+        Self::from_positions_and_faces(all_positions, all_faces, color_source)
     }
 
     fn from_positions_and_faces(
         mut positions: Vec<Vec3>,
         indexed_faces: Vec<IndexedFace>,
-        tile_width_override: Option<f32>,
-        tile_depth_override: Option<f32>,
         color_source: ColorSource,
     ) -> Result<Self, GeometryError> {
         if indexed_faces.is_empty() {
@@ -256,10 +228,9 @@ impl Mesh {
             let v0 = positions[face.indices[0]];
             let v1 = positions[face.indices[1]];
             let v2 = positions[face.indices[2]];
-            let normal = (v1 - v0)
-                .cross(v2 - v0)
-                .normalize()
-                .ok_or(GeometryError::DegenerateTriangle)?;
+            let Some(normal) = (v1 - v0).cross(v2 - v0).normalize() else {
+                continue;
+            };
 
             triangles.push(Triangle {
                 v0,
@@ -269,10 +240,13 @@ impl Mesh {
                 color: face.color,
             });
         }
+        if triangles.is_empty() {
+            return Err(GeometryError::EmptyMesh);
+        }
 
         let bounds = Bounds::from_points(&positions).ok_or(GeometryError::EmptyMesh)?;
-        let tile_width = tile_width_override.unwrap_or(bounds.max.x - bounds.min.x);
-        let tile_depth = tile_depth_override.unwrap_or(bounds.max.z - bounds.min.z);
+        let tile_width = bounds.max.x - bounds.min.x;
+        let tile_depth = bounds.max.z - bounds.min.z;
 
         if !tile_width.is_finite()
             || !tile_depth.is_finite()
@@ -486,7 +460,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tile_period_uses_bounds_or_overrides() {
+    fn tile_period_uses_bounds() {
         let obj = "\
 v -1 0 -2
 v 1 0 -2
@@ -499,11 +473,11 @@ f 1 4 3
         let path = dir.path().join("plane.obj");
         std::fs::write(&path, obj).unwrap();
 
-        let mesh = Mesh::load_obj(&path, None, Some(8.0)).unwrap();
+        let mesh = Mesh::load_obj(&path).unwrap();
 
         assert_eq!(mesh.triangles.len(), 2);
         assert_eq!(mesh.tile_width, 2.0);
-        assert_eq!(mesh.tile_depth, 8.0);
+        assert_eq!(mesh.tile_depth, 4.0);
         assert_eq!(mesh.bounds.min, Vec3::new(-1.0, 0.0, -2.0));
         assert_eq!(mesh.bounds.max.y, 0.0);
         assert_eq!(mesh.triangles[0].color, WHITE);
@@ -521,7 +495,7 @@ f 1 2 3
         let path = dir.path().join("raised.obj");
         std::fs::write(&path, obj).unwrap();
 
-        let mesh = Mesh::load_obj(&path, Some(1.0), Some(1.0)).unwrap();
+        let mesh = Mesh::load_obj(&path).unwrap();
 
         assert_eq!(mesh.original_bounds.max.y, 4.0);
         assert_eq!(mesh.y_offset_to_zero, -4.0);
@@ -541,7 +515,7 @@ f 1 2 3
         let path = dir.path().join("colors.obj");
         std::fs::write(&path, obj).unwrap();
 
-        let mesh = Mesh::load_obj(&path, Some(1.0), Some(1.0)).unwrap();
+        let mesh = Mesh::load_obj(&path).unwrap();
 
         assert_eq!(mesh.color_source, ColorSource::ObjVertexColor);
         assert_eq!(

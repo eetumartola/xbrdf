@@ -93,6 +93,11 @@ Build xBRDF as a Rust GPU baker plus later preview/shader tooling. The MVP is a 
 - 2026-04-27: `cargo test -p xbrdf-gui preview_pig_fbx_loads_when_present` passed, validating that `assets/preview/pig.fbx` loads through the GUI preview-model path.
 - 2026-04-27: Preview FBX models now use smoothed normals and smoothed tangent frames for display. The bake geometry remains faceted; smoothing is only for the 3D preview object's macro surface.
 - 2026-04-27: Added GUI save/load commands for the selected atlas. `Save Current Atlas` writes float EXR data to `xbrdf_current_atlas.exr` in the output folder, and `Load Current Atlas` restores that EXR into the 2D/3D preview using the current GUI atlas metadata.
+- 2026-04-27: Triaged outside code review. Kept the current `wgpu` + ImGui/Glium split for now because a backend rewrite is not justified by the current bottlenecks, but fixed concrete risks: sample-parallel buffers now cap lane count by a 512 MiB partial-buffer budget, GUI bake events use a bounded channel to prevent unbounded preview-frame backlog, degenerate source triangles are skipped instead of aborting whole assets, and BVH node partitioning uses `select_nth_unstable` rather than full sorting at each split.
+- 2026-04-27: `cargo check -p xbrdf-gpu -p xbrdf-gui`, `cargo test -p xbrdf-core`, and `cargo run -p xbrdf-cli -- --config assets/fixtures/flat.toml --samples 2048 --out out/flat_review_check` passed after the review-driven robustness changes.
+- 2026-04-28: Moved the 3D preview light control into the 3D Preview window as sliders and made the 2D viewport history slider use the full viewport window width instead of the fitted image width.
+- 2026-04-28: Fixed the 3D preview's isotropic atlas lookup to ignore mesh UV/tangent heading. Isotropic preview now builds a per-fragment frame from the smoothed normal and projected view direction, so UV seams should not introduce BRDF heading discontinuities; full anisotropic preview still uses the mesh `du`/`dv` tangent frame.
+- 2026-04-28: Removed tile width/depth override parameters from config, CLI, and GUI. The periodic XZ tile period is now always derived from loaded geometry bounds, while manifests continue recording the resolved tile size for reproducibility.
 
 ## Acceptance Criteria
 
