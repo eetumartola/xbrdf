@@ -1,3 +1,4 @@
+use crate::atlas::{AtlasMetadata, ARTIFACT_SCHEMA_VERSION};
 use crate::math::Vec3;
 use crate::sampling::hemisphere_latlong_direction;
 use serde::{Deserialize, Serialize};
@@ -109,9 +110,11 @@ pub struct ResolvedMaterial {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
+    pub schema_version: u32,
     pub tool: ToolInfo,
     pub input: InputInfo,
     pub output: OutputInfo,
+    pub lookup: AtlasMetadata,
     pub convention: ConventionInfo,
     pub bake: BakeInfo,
 }
@@ -125,6 +128,7 @@ pub struct ToolInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InputInfo {
     pub obj: PathBuf,
+    pub content_blake3: String,
     pub triangle_count: usize,
     pub color_source: String,
     pub height_offset_to_zero: f32,
@@ -195,12 +199,14 @@ pub enum ConfigError {
     #[error("failed to parse config {path}: {source}")]
     ParseConfig {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("missing required OBJ path; set `obj` in the config or pass --obj")]
     MissingObj,
     #[error("width and height must both be greater than zero")]
     InvalidResolution,
+    #[error("resolved atlas dimensions overflow the supported 32-bit image extent")]
+    InvalidAtlasDimensions,
     #[error("samples must be greater than zero")]
     InvalidSamples,
     #[error("light direction must be finite, non-zero, and above the +Y macro plane")]
@@ -255,7 +261,7 @@ impl FromStr for BakeMode {
             "single" | "fixed" | "fixed_light" | "fixed-light" => Ok(Self::Single),
             "full" | "anisotropic" | "4d" => Ok(Self::Full),
             "isotropic" | "iso" => Ok(Self::Isotropic),
-            _ => Err(format!("expected one of: single, full, isotropic")),
+            _ => Err("expected one of: single, full, isotropic".to_string()),
         }
     }
 }
@@ -273,7 +279,7 @@ impl FromStr for SamplerKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "halton" | "qmc" | "low_discrepancy" | "low-discrepancy" => Ok(Self::Halton),
             "random" | "hashed" | "hash" => Ok(Self::Random),
-            _ => Err(format!("expected one of: halton, random")),
+            _ => Err("expected one of: halton, random".to_string()),
         }
     }
 }
@@ -291,9 +297,7 @@ impl FromStr for MaterialKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "lambertian" | "diffuse" => Ok(Self::Lambertian),
             "specular" | "specular_phong" | "specular-phong" | "phong" => Ok(Self::SpecularPhong),
-            _ => Err(format!(
-                "expected one of: lambertian, specular_phong, specular"
-            )),
+            _ => Err("expected one of: lambertian, specular_phong, specular".to_string()),
         }
     }
 }
@@ -338,11 +342,15 @@ impl ResolvedBakeConfig {
     }
 
     pub fn atlas_width(&self) -> u32 {
-        self.camera_tile_width() * self.effective_light_width()
+        self.camera_tile_width()
+            .checked_mul(self.effective_light_width())
+            .expect("resolved atlas width is validated")
     }
 
     pub fn atlas_height(&self) -> u32 {
-        self.camera_tile_height() * self.effective_light_height()
+        self.camera_tile_height()
+            .checked_mul(self.effective_light_height())
+            .expect("resolved atlas height is validated")
     }
 
     pub fn effective_light_width(&self) -> u32 {
@@ -360,7 +368,9 @@ impl ResolvedBakeConfig {
     }
 
     pub fn light_count(&self) -> u32 {
-        self.effective_light_width() * self.effective_light_height()
+        self.effective_light_width()
+            .checked_mul(self.effective_light_height())
+            .expect("resolved light count is validated")
     }
 
     pub fn light_direction_for_tile(&self, light_x: u32, light_y: u32) -> [f32; 3] {
@@ -398,7 +408,7 @@ impl BakeConfigFile {
 
         toml::from_str(&contents).map_err(|source| ConfigError::ParseConfig {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })
     }
 
@@ -432,6 +442,29 @@ impl BakeConfigFile {
             .unwrap_or(DEFAULT_LIGHT_HEIGHT);
         if light_width == 0 || light_height == 0 {
             return Err(ConfigError::InvalidResolution);
+        }
+        let camera_width = if mode == BakeMode::Isotropic {
+            1
+        } else {
+            width
+        };
+        let effective_light_width = if mode == BakeMode::Single {
+            1
+        } else {
+            light_width
+        };
+        let effective_light_height = if mode == BakeMode::Single {
+            1
+        } else {
+            light_height
+        };
+        if camera_width.checked_mul(effective_light_width).is_none()
+            || height.checked_mul(effective_light_height).is_none()
+            || effective_light_width
+                .checked_mul(effective_light_height)
+                .is_none()
+        {
+            return Err(ConfigError::InvalidAtlasDimensions);
         }
 
         let samples = overrides
@@ -481,14 +514,16 @@ impl BakeConfigFile {
 }
 
 impl Manifest {
-    pub fn new(config: &ResolvedBakeConfig, mesh: &crate::geometry::Mesh) -> Self {
-        Self {
+    pub fn new(config: &ResolvedBakeConfig, mesh: &crate::geometry::Mesh) -> std::io::Result<Self> {
+        Ok(Self {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
             tool: ToolInfo {
                 name: "xbrdf-bake".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             input: InputInfo {
                 obj: config.obj.clone(),
+                content_blake3: file_blake3(&config.obj)?,
                 triangle_count: mesh.triangles.len(),
                 color_source: mesh.color_source.as_str().to_string(),
                 height_offset_to_zero: mesh.y_offset_to_zero,
@@ -508,6 +543,7 @@ impl Manifest {
                 tile_width: config.camera_tile_width(),
                 tile_height: config.camera_tile_height(),
             },
+            lookup: AtlasMetadata::from_config(config),
             convention: ConventionInfo {
                 coordinate_system: "Houdini Y-up, sample tile in XZ".to_string(),
                 macro_normal: [0.0, 1.0, 0.0],
@@ -547,8 +583,24 @@ impl Manifest {
                     "direct lighting with camera visibility only; shadow rays disabled".to_string()
                 },
             },
-        }
+        })
     }
+}
+
+fn file_blake3(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn resolve_path(config_dir: Option<&Path>, path: PathBuf) -> PathBuf {
@@ -700,6 +752,24 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_atlas_dimensions_are_rejected() {
+        let config = BakeConfigFile {
+            obj: Some("flat.obj".into()),
+            width: Some(u32::MAX),
+            height: Some(1),
+            mode: Some(BakeMode::Full),
+            light_width: Some(2),
+            light_height: Some(1),
+            ..BakeConfigFile::default()
+        };
+
+        assert!(matches!(
+            config.resolve(None, BakeOverrides::default()),
+            Err(ConfigError::InvalidAtlasDimensions)
+        ));
+    }
+
+    #[test]
     fn manifest_round_trips_through_toml() {
         let mesh = crate::geometry::Mesh {
             triangles: Vec::new(),
@@ -718,8 +788,11 @@ mod tests {
             tile_depth: 2.0,
             color_source: crate::geometry::ColorSource::None,
         };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("flat.obj");
+        std::fs::write(&input, b"fixture").unwrap();
         let config = ResolvedBakeConfig {
-            obj: "flat.obj".into(),
+            obj: input,
             width: 4,
             height: 2,
             mode: BakeMode::Single,
@@ -737,7 +810,7 @@ mod tests {
             },
         };
 
-        let manifest = Manifest::new(&config, &mesh);
+        let manifest = Manifest::new(&config, &mesh).unwrap();
         let encoded = toml::to_string_pretty(&manifest).unwrap();
         let decoded: Manifest = toml::from_str(&encoded).unwrap();
 

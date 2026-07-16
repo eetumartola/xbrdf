@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+blake3.workspace = true
 thiserror.workspace = true
 wgpu.workspace = true
 xbrdf-core.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

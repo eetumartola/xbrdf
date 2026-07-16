@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use exr::prelude::write_rgb_file;
+use exr::prelude::{read_first_rgba_layer_from_file, write_rgb_file};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use xbrdf_core::{
@@ -20,6 +20,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Bake(BakeArgs),
+    Validate(BakeArgs),
+    Compare(CompareArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -58,52 +60,33 @@ struct BakeArgs {
     roughness: Option<f32>,
 }
 
+#[derive(Debug, Args)]
+struct CompareArgs {
+    first: PathBuf,
+    second: PathBuf,
+    #[arg(long)]
+    tolerance: Option<f32>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Some(Command::Bake(args)) => bake(args),
+        Some(Command::Validate(args)) => validate(args),
+        Some(Command::Compare(args)) => compare(args),
         None => bake(cli.bake_args),
     }
 }
 
 fn bake(args: BakeArgs) -> Result<()> {
     let total_start = Instant::now();
-    let config_start = Instant::now();
-    let file_config = if let Some(config_path) = &args.config {
-        BakeConfigFile::read(config_path)
-            .with_context(|| format!("failed to load bake config {}", config_path.display()))?
-    } else {
-        BakeConfigFile::default()
-    };
-
-    let resolved = file_config
-        .resolve(
-            args.config.as_deref(),
-            BakeOverrides {
-                obj: args.obj,
-                width: args.width,
-                height: args.height,
-                mode: args.mode,
-                light_width: args.light_width,
-                light_height: args.light_height,
-                samples: args.samples,
-                light: args.light,
-                max_repeat_radius: args.max_repeat_radius,
-                sampler: args.sampler,
-                enable_shadows: args.enable_shadows,
-                material_kind: args.material,
-                material_color: args.material_color,
-                material_roughness: args.roughness,
-            },
-        )
-        .context("failed to resolve bake settings")?;
-    let config_time = config_start.elapsed();
-
-    let load_start = Instant::now();
-    let mesh = Mesh::load(&resolved.obj)
-        .with_context(|| format!("failed to load geometry {}", resolved.obj.display()))?;
-    let load_time = load_start.elapsed();
+    let LoadedInputs {
+        resolved,
+        mesh,
+        config_time,
+        load_time,
+    } = load_inputs(&args)?;
 
     let out = args
         .out
@@ -129,7 +112,7 @@ fn bake(args: BakeArgs) -> Result<()> {
     )
     .with_context(|| format!("failed to write EXR {}", image_path.display()))?;
 
-    let manifest = Manifest::new(&resolved, &mesh);
+    let manifest = Manifest::new(&resolved, &mesh).context("failed to hash input geometry")?;
     let manifest_path = out.join("manifest.toml");
     let manifest_text = toml::to_string_pretty(&manifest).context("failed to encode manifest")?;
     std::fs::write(&manifest_path, manifest_text)
@@ -153,6 +136,126 @@ fn bake(args: BakeArgs) -> Result<()> {
     Ok(())
 }
 
+struct LoadedInputs {
+    resolved: xbrdf_core::ResolvedBakeConfig,
+    mesh: Mesh,
+    config_time: Duration,
+    load_time: Duration,
+}
+
+fn load_inputs(args: &BakeArgs) -> Result<LoadedInputs> {
+    let config_start = Instant::now();
+    let file_config = if let Some(config_path) = &args.config {
+        BakeConfigFile::read(config_path)
+            .with_context(|| format!("failed to load bake config {}", config_path.display()))?
+    } else {
+        BakeConfigFile::default()
+    };
+    let resolved = file_config
+        .resolve(
+            args.config.as_deref(),
+            BakeOverrides {
+                obj: args.obj.clone(),
+                width: args.width,
+                height: args.height,
+                mode: args.mode,
+                light_width: args.light_width,
+                light_height: args.light_height,
+                samples: args.samples,
+                light: args.light,
+                max_repeat_radius: args.max_repeat_radius,
+                sampler: args.sampler,
+                enable_shadows: args.enable_shadows,
+                material_kind: args.material,
+                material_color: args.material_color,
+                material_roughness: args.roughness,
+            },
+        )
+        .context("failed to resolve bake settings")?;
+    let config_time = config_start.elapsed();
+    let load_start = Instant::now();
+    let mesh = Mesh::load(&resolved.obj)
+        .with_context(|| format!("failed to load geometry {}", resolved.obj.display()))?;
+    Ok(LoadedInputs {
+        resolved,
+        mesh,
+        config_time,
+        load_time: load_start.elapsed(),
+    })
+}
+
+fn validate(args: BakeArgs) -> Result<()> {
+    let loaded = load_inputs(&args)?;
+    let config = loaded.resolved;
+    println!("configuration valid");
+    println!("  geometry: {} triangles", loaded.mesh.triangles.len());
+    println!(
+        "  output: {}x{}; tile {}x{}; {} light directions",
+        config.atlas_width(),
+        config.atlas_height(),
+        config.camera_tile_width(),
+        config.camera_tile_height(),
+        config.light_count()
+    );
+    println!(
+        "  camera rays: {}",
+        config.atlas_width() as u64 * config.atlas_height() as u64 * config.samples as u64
+    );
+    Ok(())
+}
+
+fn compare(args: CompareArgs) -> Result<()> {
+    let (first_width, first_height, first) = read_exr(&args.first)?;
+    let (second_width, second_height, second) = read_exr(&args.second)?;
+    if (first_width, first_height) != (second_width, second_height) {
+        anyhow::bail!(
+            "image dimensions differ: {first_width}x{first_height} versus {second_width}x{second_height}"
+        );
+    }
+
+    let mut absolute_sum = 0.0f64;
+    let mut squared_sum = 0.0f64;
+    let mut maximum = 0.0f32;
+    for (a, b) in first.iter().zip(&second) {
+        for channel in 0..3 {
+            let difference = (a[channel] - b[channel]).abs();
+            absolute_sum += difference as f64;
+            squared_sum += (difference * difference) as f64;
+            maximum = maximum.max(difference);
+        }
+    }
+    let value_count = (first.len() * 3) as f64;
+    println!("pixels: {}", first.len());
+    println!("mean absolute error: {:.8}", absolute_sum / value_count);
+    println!(
+        "root mean square error: {:.8}",
+        (squared_sum / value_count).sqrt()
+    );
+    println!("maximum absolute error: {maximum:.8}");
+    if args.tolerance.is_some_and(|tolerance| maximum > tolerance) {
+        anyhow::bail!("maximum error {maximum} exceeds tolerance");
+    }
+    Ok(())
+}
+
+fn read_exr(path: &std::path::Path) -> Result<(u32, u32, Vec<[f32; 3]>)> {
+    let image = read_first_rgba_layer_from_file(
+        path,
+        |resolution, _channels| {
+            (
+                resolution.width() as u32,
+                resolution.height() as u32,
+                vec![[0.0f32; 3]; resolution.area()],
+            )
+        },
+        |pixels, position, (r, g, b, _a): (f32, f32, f32, f32)| {
+            pixels.2[position.y() * pixels.0 as usize + position.x()] = [r, g, b];
+        },
+    )
+    .with_context(|| format!("failed to read EXR {}", path.display()))?;
+    Ok(image.layer_data.channel_data.pixels)
+}
+
 struct PhaseTimes {
     config: Duration,
     load: Duration,
@@ -167,8 +270,9 @@ fn print_stats(
     times: PhaseTimes,
 ) {
     let pixel_count = stats.width as u64 * stats.height as u64;
-    let rays_per_second = if stats.gpu_dispatch_time.as_secs_f64() > 0.0 {
-        stats.camera_ray_count as f64 / stats.gpu_dispatch_time.as_secs_f64()
+    let throughput_time = stats.gpu_timestamp_time.unwrap_or(stats.gpu_dispatch_time);
+    let rays_per_second = if throughput_time.as_secs_f64() > 0.0 {
+        stats.camera_ray_count as f64 / throughput_time.as_secs_f64()
     } else {
         0.0
     };
@@ -263,10 +367,15 @@ fn print_stats(
         format_duration(times.write),
         format_duration(times.total)
     );
-    println!(
-        "  throughput: {:.0} camera rays/s during GPU dispatch",
-        rays_per_second
-    );
+    if let Some(gpu_time) = stats.gpu_timestamp_time {
+        println!(
+            "  GPU timestamp: {} compute time",
+            format_duration(gpu_time)
+        );
+    } else {
+        println!("  GPU timestamp: unsupported by the selected adapter");
+    }
+    println!("  throughput: {rays_per_second:.0} camera rays/s");
 }
 
 fn format_duration(duration: Duration) -> String {

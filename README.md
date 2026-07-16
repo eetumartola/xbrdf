@@ -29,12 +29,19 @@ cargo run -- --config assets/fixtures/flat.toml --out out/flat
 cargo run --release -- --config assets/fixtures/specular.toml --out out/specular
 ```
 
+Validate a configuration and geometry without starting GPU work, or compare two EXR outputs:
+
+```powershell
+cargo run -- validate --config assets/fixtures/flat.toml
+cargo run -- compare out/old/xbrdf_view.exr out/new/xbrdf_view.exr --tolerance 0.001
+```
+
 The bake writes:
 
 - `xbrdf_view.exr`: RGB float response. In `single` mode this is one hemisphere latlong pano. In atlas modes this is one large texture containing a grid of response tiles.
-- `manifest.toml`: resolved bake settings and conventions.
+- `manifest.toml`: versioned resolved settings, input BLAKE3 hash, atlas lookup metadata, and conventions.
 
-After each bake, the CLI prints basic timing and workload stats: geometry size, BVH node count, image size, samples, periodic repeat cap, dispatch chunks, estimated ray work, and phase timings. GPU work is chunked by a trace budget rounded up to full 8-row compute workgroups. High-sample CLI bakes use a sample-parallel path that dispatches multiple sample lanes per pixel, improving occupancy for very specular, high-sample renders. Very large CLI bakes switch to larger 512-sample lanes to reduce wave count. The GPU BVH uses binned SAH splitting, which costs more to build than median splitting but improves traversal for large sample counts.
+After each bake, the CLI prints geometry/workload counts, wall-clock phase timings, and GPU compute timestamps when the selected adapter supports timestamp queries. GPU work is chunked by a trace budget rounded up to full 8-row compute workgroups. High-sample bakes dispatch multiple sample lanes per pixel and switch to 512-sample lanes for very large sample counts. Atlas bakes process up to eight light tiles per GPU submission/readback batch. Within one process, the GPU device, pipeline, and mesh buffers are cached and reused until the input geometry changes. Scene and output buffer sizes are checked against the selected device limits before allocation. The GPU BVH uses binned SAH splitting and a depth-balanced fallback that keeps traversal within the shader's fixed stack.
 
 ## GUI
 
@@ -44,7 +51,7 @@ Launch the Dear ImGui bake-control app from the repo root:
 cargo gui
 ```
 
-The GUI exposes the same basic bake settings as the CLI: config path, source geometry, output folder, resolution, bake mode, light-grid dimensions, samples, repeat radius, light, material, color, and roughness. Bakes run on a background thread. `single` mode progressively updates the full image as new sample batches are integrated; atlas modes update the viewport and progress bar as each light tile completes. The GUI shows the calculated output texture extent from the camera tile and light grid. Finished renders are retained in session history; use the ticked slider under the viewport to scrub back through completed bakes. `Save Current Atlas` writes the selected live/history atlas as `xbrdf_current_atlas.exr` in the output folder, and `Load Current Atlas` reads that file back using the current GUI mode and atlas-dimension settings. The 3D preview window shades the selected preview model from the currently selected 2D preview or history entry and uses the matching `single`, `full`, or `isotropic` atlas lookup path. Preview models include the synthetic torus plus FBX files in `assets/preview`; FBX models are centered and uniformly scaled to fit the preview, use smoothed preview normals, and use UVs for anisotropic `du`/`dv` tangent directions when present. Drag inside the 3D image to rotate freely, right-drag to roll, and double-click it to reset rotation. The GUI sample input currently allows up to 100,000,000 samples. The GUI still writes `xbrdf_view.exr` and `manifest.toml` to the selected output folder.
+The GUI exposes the same bake settings as the CLI and runs bakes on a background thread. `single` mode progressively updates the full image; atlas modes update as each light tile completes. Use `Cancel Bake` to stop between dispatch batches or atlas tiles. Finished-render history is capped at 512 MiB. `Save Current Atlas` writes `xbrdf_current_atlas.exr` plus `xbrdf_current_atlas.toml`; load uses the sidecar metadata rather than current controls. The 3D preview supports `single`, `full`, and `isotropic` lookup on a torus or FBX models from `assets/preview`. Drag to rotate, right-drag to roll, and double-click to reset.
 
 `width` and `height` are the camera tile resolution. They are not read from the source mesh. OBJ/FBX files are used for triangle geometry and the periodic XZ tile bounds.
 
@@ -108,10 +115,14 @@ roughness = 0.02
 - Pano rows run from zenith at the top to horizon at the bottom.
 - Shading uses faceted geometric triangle normals. OBJ vertex normals and smoothing groups are ignored.
 
-## MVP Limits
+## Atlas Lookup Contract
 
-- One fixed light direction.
-- White Lambertian and normalized Phong specular materials.
-- Direct lighting and visibility only.
-- GPU BVH triangle intersection with chunked row dispatches.
-- Texture maps, multiple scattering, multi-light BRDF sweeps, and Houdini shader lookup are post-MVP work.
+`manifest.toml` contains a versioned `lookup` table with the bake mode, atlas and tile dimensions, light grid, texel-center convention, azimuth wrapping, elevation clamping, and macro-cosine requirement. `xbrdf-core::AtlasMetadata`, `hemisphere_uv`, `texel_for_light_tile`, and `light_grid_position` are the reference CPU contract for consumers. Camera azimuth and light-grid azimuth wrap; elevation clamps at zenith and horizon. Consumers multiply the lookup response by the local macro cosine `max(dot(N, L), 0)`.
+
+## Current Limits
+
+- Lambertian diffuse and normalized Phong specular materials.
+- Direct single-bounce lighting with optional shadow visibility.
+- Full and isotropic light-direction atlases; texture maps and multiple scattering are not implemented.
+- GPU BVH traversal uses a fixed shader stack and bounded periodic search.
+- Houdini integration is not yet packaged, but the versioned manifest and `xbrdf-core` lookup helpers define the consumer contract.

@@ -3,8 +3,8 @@ const INV_PI: f32 = 0.31830988618379067154;
 const TAU: f32 = 6.28318530717958647692;
 const HALF_PI: f32 = 1.57079632679489661923;
 const EPSILON: f32 = 0.0000001;
-const HIT_EPSILON: f32 = 0.0001;
 const STACK_SIZE: u32 = 64u;
+const OUTPUT_SUM: u32 = 1u;
 
 struct Triangle {
     v0: vec4<f32>,
@@ -44,6 +44,7 @@ struct Params {
     material_color: vec4<f32>,
     material_kind: vec4<u32>,
     material_params: vec4<f32>,
+    intersection_params: vec4<f32>,
 };
 
 struct Hit {
@@ -188,7 +189,7 @@ fn intersect_triangle(origin: vec3<f32>, direction: vec3<f32>, triangle: Triangl
     let p = cross(direction, edge2);
     let det = dot(edge1, p);
 
-    if (abs(det) < EPSILON) {
+    if (abs(det) < params.intersection_params.y) {
         return -1.0;
     }
 
@@ -206,7 +207,7 @@ fn intersect_triangle(origin: vec3<f32>, direction: vec3<f32>, triangle: Triangl
     }
 
     let t = dot(edge2, q) * inv_det;
-    if (t <= HIT_EPSILON) {
+    if (t <= params.intersection_params.x) {
         return -1.0;
     }
 
@@ -249,7 +250,9 @@ fn trace_bvh(origin: vec3<f32>, direction: vec3<f32>, offset: vec3<f32>) -> Hit 
                     if (t > 0.0 && t < hit.t) {
                         hit.found = true;
                         hit.t = t;
-                        hit.position = origin + direction * t;
+                        // Keep the hit in the canonical tile so shadow-copy offsets are
+                        // centered on the cell that was actually hit.
+                        hit.position = local_origin + direction * t;
                         hit.normal = normalize(triangles[triangle_index].normal.xyz);
                         hit.color = triangles[triangle_index].color.xyz;
                     }
@@ -410,7 +413,7 @@ fn shade_samples(x: u32, y: u32, sample_start: u32, sample_count: u32, wo: vec3<
                     if (params.material_kind.z == 0u) {
                         sum = sum + contribution;
                     } else {
-                        let shadow_origin = hit.position + params.light_dir.xyz * HIT_EPSILON * 4.0;
+                        let shadow_origin = hit.position + params.light_dir.xyz * margin;
                         if (!any_shadow_hit(shadow_origin, params.light_dir.xyz, shadow_rx, shadow_rz)) {
                             sum = sum + contribution;
                         }
@@ -449,7 +452,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let active_samples = min(params.samples, params.sample_limit - sample_start);
     let sum = shade_samples(x, y, sample_start, active_samples, wo);
-    if (params.sample_lanes == 1u && params.samples == params.target_samples) {
+    if (params.material_kind.w != OUTPUT_SUM) {
         output_pixels[out_index] = vec4<f32>(sum / f32(active_samples), 1.0);
     } else {
         output_pixels[out_index] = vec4<f32>(sum, f32(active_samples));

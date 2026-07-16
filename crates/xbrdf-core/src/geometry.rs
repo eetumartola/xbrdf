@@ -1,5 +1,8 @@
+use crate::fbx::{
+    child_f64_array, child_i32_array, child_string, decode_polygon_index, geometry_nodes,
+};
 use crate::math::Vec3;
-use fbx::{Node, Property};
+use fbx::Node;
 use std::path::{Path, PathBuf};
 
 const MIN_TILE_SIZE: f32 = 1.0e-6;
@@ -63,12 +66,14 @@ pub enum GeometryError {
     LoadFbx { path: PathBuf, source: fbx::Error },
     #[error("unsupported input extension for {0}; expected .obj or .fbx")]
     UnsupportedExtension(PathBuf),
-    #[error("OBJ contains no triangles")]
+    #[error("geometry contains no triangles")]
     EmptyMesh,
-    #[error("OBJ contains a non-finite position")]
+    #[error("geometry contains a non-finite position")]
     NonFinitePosition,
-    #[error("OBJ contains a degenerate triangle")]
-    DegenerateTriangle,
+    #[error("geometry contains a non-finite color")]
+    NonFiniteColor,
+    #[error("geometry contains an invalid vertex index")]
+    InvalidVertexIndex,
     #[error("tile size must be non-zero in X and Z; geometry bounds are used as the tile period")]
     InvalidTileSize,
 }
@@ -188,15 +193,15 @@ impl Mesh {
         let mut all_faces = Vec::new();
         let mut color_source = ColorSource::None;
         for geometry in fbx.children.iter().flat_map(geometry_nodes) {
-            let Some((positions, faces, source)) = parse_fbx_geometry(geometry) else {
+            let Some(parsed) = parse_fbx_geometry(geometry)? else {
                 continue;
             };
             let base_index = all_positions.len();
-            all_positions.extend(positions);
-            if source != ColorSource::None {
-                color_source = source;
+            all_positions.extend(parsed.positions);
+            if parsed.color_source != ColorSource::None {
+                color_source = parsed.color_source;
             }
-            all_faces.extend(faces.into_iter().map(|face| IndexedFace {
+            all_faces.extend(parsed.faces.into_iter().map(|face| IndexedFace {
                 indices: [
                     base_index + face.indices[0],
                     base_index + face.indices[1],
@@ -214,6 +219,12 @@ impl Mesh {
         indexed_faces: Vec<IndexedFace>,
         color_source: ColorSource,
     ) -> Result<Self, GeometryError> {
+        if positions.iter().any(|position| !position.is_finite()) {
+            return Err(GeometryError::NonFinitePosition);
+        }
+        if indexed_faces.iter().any(|face| !face.color.is_finite()) {
+            return Err(GeometryError::NonFiniteColor);
+        }
         if indexed_faces.is_empty() {
             return Err(GeometryError::EmptyMesh);
         }
@@ -225,9 +236,10 @@ impl Mesh {
 
         let mut triangles = Vec::with_capacity(indexed_faces.len());
         for face in indexed_faces {
-            let v0 = positions[face.indices[0]];
-            let v1 = positions[face.indices[1]];
-            let v2 = positions[face.indices[2]];
+            let [Some(&v0), Some(&v1), Some(&v2)] = face.indices.map(|index| positions.get(index))
+            else {
+                return Err(GeometryError::InvalidVertexIndex);
+            };
             let Some(normal) = (v1 - v0).cross(v2 - v0).normalize() else {
                 continue;
             };
@@ -276,6 +288,12 @@ struct IndexedFace {
     color: Vec3,
 }
 
+struct ParsedFbxGeometry {
+    positions: Vec<Vec3>,
+    faces: Vec<IndexedFace>,
+    color_source: ColorSource,
+}
+
 fn read_obj_color(colors: &[f32], index: usize) -> Vec3 {
     let offset = index * 3;
     if offset + 2 < colors.len() {
@@ -289,24 +307,16 @@ fn average_color(colors: [Vec3; 3]) -> Vec3 {
     (colors[0] + colors[1] + colors[2]) / 3.0
 }
 
-fn geometry_nodes<'a>(node: &'a Node) -> Vec<&'a Node> {
-    let mut nodes = Vec::new();
-    collect_geometry_nodes(node, &mut nodes);
-    nodes
-}
-
-fn collect_geometry_nodes<'a>(node: &'a Node, nodes: &mut Vec<&'a Node>) {
-    if node.name == "Geometry" {
-        nodes.push(node);
+fn parse_fbx_geometry(node: &Node) -> Result<Option<ParsedFbxGeometry>, GeometryError> {
+    let Some(vertices) = child_f64_array(node, "Vertices") else {
+        return Ok(None);
+    };
+    let Some(polygon_indices) = child_i32_array(node, "PolygonVertexIndex") else {
+        return Ok(None);
+    };
+    if vertices.len() % 3 != 0 {
+        return Err(GeometryError::InvalidVertexIndex);
     }
-    for child in &node.children {
-        collect_geometry_nodes(child, nodes);
-    }
-}
-
-fn parse_fbx_geometry(node: &Node) -> Option<(Vec<Vec3>, Vec<IndexedFace>, ColorSource)> {
-    let vertices = child_f64_array(node, "Vertices")?;
-    let polygon_indices = child_i32_array(node, "PolygonVertexIndex")?;
     let positions: Vec<_> = vertices
         .chunks_exact(3)
         .map(|chunk| Vec3::new(chunk[0] as f32, chunk[1] as f32, chunk[2] as f32))
@@ -324,12 +334,11 @@ fn parse_fbx_geometry(node: &Node) -> Option<(Vec<Vec3>, Vec<IndexedFace>, Color
     let mut polygon_index = 0usize;
 
     for raw_index in polygon_indices {
-        let end = raw_index < 0;
-        let vertex_index = if end {
-            (-raw_index - 1) as usize
-        } else {
-            raw_index as usize
-        };
+        let (vertex_index, end) =
+            decode_polygon_index(raw_index).ok_or(GeometryError::InvalidVertexIndex)?;
+        if vertex_index >= positions.len() {
+            return Err(GeometryError::InvalidVertexIndex);
+        }
         polygon.push(vertex_index);
 
         if end {
@@ -357,7 +366,11 @@ fn parse_fbx_geometry(node: &Node) -> Option<(Vec<Vec3>, Vec<IndexedFace>, Color
         }
     }
 
-    Some((positions, faces, color_source))
+    Ok(Some(ParsedFbxGeometry {
+        positions,
+        faces,
+        color_source,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -422,37 +435,6 @@ fn fbx_color_layer(node: &Node) -> Option<FbxColorLayer> {
         colors,
         indices,
     })
-}
-
-fn child_f64_array(node: &Node, name: &str) -> Option<Vec<f64>> {
-    node.children
-        .iter()
-        .find(|child| child.name == name)
-        .and_then(|child| match child.properties.first()? {
-            Property::F64Array(values) => Some(values.clone()),
-            Property::F32Array(values) => Some(values.iter().map(|value| *value as f64).collect()),
-            _ => None,
-        })
-}
-
-fn child_i32_array(node: &Node, name: &str) -> Option<Vec<i32>> {
-    node.children
-        .iter()
-        .find(|child| child.name == name)
-        .and_then(|child| match child.properties.first()? {
-            Property::I32Array(values) => Some(values.clone()),
-            _ => None,
-        })
-}
-
-fn child_string(node: &Node, name: &str) -> Option<String> {
-    node.children
-        .iter()
-        .find(|child| child.name == name)
-        .and_then(|child| match child.properties.first()? {
-            Property::String(value) => Some(value.clone()),
-            _ => None,
-        })
 }
 
 #[cfg(test)]

@@ -1,6 +1,9 @@
+mod artifact;
+mod preview_math;
 use anyhow::{Context, Result};
-use exr::prelude::{read_first_rgba_layer_from_file, write_rgb_file};
-use fbx::{Node, Property};
+use artifact::{PreviewImage, PreviewMeta};
+use exr::prelude::write_rgb_file;
+use fbx::Node;
 use glium::framebuffer::SimpleFrameBuffer;
 use glium::index::PrimitiveType;
 use glium::texture::DepthTexture2d;
@@ -23,6 +26,10 @@ use imgui_winit_support::winit::{
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
 };
+use preview_math::{
+    cross3, look_at, normalize3, normalize_quat, perspective, quat_from_axis_angle, quat_mul,
+    quat_to_mat4,
+};
 use raw_window_handle::HasRawWindowHandle;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -31,14 +38,20 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
-use xbrdf_core::{
-    BakeConfigFile, BakeMode, BakeOverrides, Manifest, MaterialKind, Mesh, ResolvedBakeConfig,
-    SamplerKind, Vec3,
+use xbrdf_core::fbx::{
+    child_f64_array, child_i32_array, child_string, decode_polygon_index, geometry_nodes,
 };
-use xbrdf_gpu::{AtlasProgressFrame, GpuBakeStats, ProgressiveBakeOptions, ProgressiveFrame};
+use xbrdf_core::{
+    AtlasMetadata, BakeConfigFile, BakeMode, BakeOverrides, Manifest, MaterialKind, Mesh,
+    ResolvedBakeConfig, SamplerKind, Vec3,
+};
+use xbrdf_gpu::{
+    AtlasProgressFrame, BakeControl, GpuBakeStats, ProgressiveBakeOptions, ProgressiveFrame,
+};
 
 const TITLE: &str = "xBRDF Bake";
 const MAX_GUI_SAMPLES: i32 = 100_000_000;
+const MAX_HISTORY_BYTES: usize = 512 * 1024 * 1024;
 
 fn main() {
     if let Err(error) = run() {
@@ -204,6 +217,7 @@ impl BakeSettings {
 struct AppState {
     settings: BakeSettings,
     receiver: Option<Receiver<BakeEvent>>,
+    bake_control: Option<BakeControl>,
     baking: bool,
     progress: f32,
     completed_samples: u32,
@@ -225,6 +239,7 @@ impl Default for AppState {
         Self {
             settings: BakeSettings::default(),
             receiver: None,
+            bake_control: None,
             baking: false,
             progress: 0.0,
             completed_samples: 0,
@@ -260,6 +275,8 @@ impl AppState {
 
         let settings = self.settings.clone();
         let (sender, receiver) = mpsc::sync_channel(2);
+        let control = BakeControl::default();
+        self.bake_control = Some(control.clone());
         self.receiver = Some(receiver);
         self.baking = true;
         self.progress = 0.0;
@@ -271,13 +288,20 @@ impl AppState {
         self.follow_latest = true;
 
         std::thread::spawn(move || {
-            let result = run_bake(settings, |event| {
+            let result = run_bake(settings, control, |event| {
                 let _ = sender.send(event);
             });
             if let Err(error) = result {
                 let _ = sender.send(BakeEvent::Error(format!("{error:#}")));
             }
         });
+    }
+
+    fn cancel_bake(&mut self) {
+        if let Some(control) = &self.bake_control {
+            control.cancel();
+            self.status = "Cancelling bake".to_string();
+        }
     }
 
     fn receive_bake_events(&mut self) {
@@ -289,20 +313,16 @@ impl AppState {
         while let Ok(event) = receiver.try_recv() {
             match event {
                 BakeEvent::Status(status) => self.status = status,
-                BakeEvent::Started { width, height } => {
-                    self.preview = PreviewImage::new(
-                        width,
-                        height,
-                        PreviewMeta::from_settings(&self.settings),
-                    );
+                BakeEvent::Started {
+                    width,
+                    height,
+                    meta,
+                    total_work,
+                } => {
+                    self.preview = PreviewImage::new(width, height, meta);
                     self.latest_bake_preview = Some(self.preview.clone());
                     self.preview_dirty = true;
-                    self.total_samples = if self.settings.bake_mode() == BakeMode::Single {
-                        self.settings.samples.max(1) as u32
-                    } else {
-                        let (_, _, _, _, light_count) = preview_extents(&self.settings);
-                        light_count
-                    };
+                    self.total_samples = total_work;
                     self.completed_samples = 0;
                     self.progress = 0.0;
                     self.status = "Baking".to_string();
@@ -351,11 +371,12 @@ impl AppState {
                     manifest,
                 } => {
                     self.baking = false;
+                    self.bake_control = None;
                     keep_receiver = false;
                     self.progress = 1.0;
                     self.completed_samples = self.total_samples;
                     self.last_stats = Some(stats);
-                    let label = if self.settings.bake_mode() == BakeMode::Single {
+                    let label = if self.preview.meta.mode == BakeMode::Single {
                         format!("{} samples", self.total_samples)
                     } else {
                         format!("{} light tiles", self.total_samples)
@@ -373,6 +394,7 @@ impl AppState {
                 }
                 BakeEvent::Error(error) => {
                     self.baking = false;
+                    self.bake_control = None;
                     keep_receiver = false;
                     self.latest_bake_preview = None;
                     self.status = error;
@@ -385,8 +407,26 @@ impl AppState {
         }
     }
 
+    fn history_bytes(&self) -> usize {
+        self.history
+            .iter()
+            .map(|snapshot| {
+                snapshot.image.rgb.len() * std::mem::size_of::<[f32; 3]>()
+                    + snapshot.image.rgba.len()
+            })
+            .sum()
+    }
+
+    fn trim_history(&mut self, max_bytes: usize) {
+        while self.history.len() > 1 && self.history_bytes() > max_bytes {
+            self.history.remove(0);
+            self.history_index = (self.history_index - 1).max(-1);
+        }
+    }
+
     fn push_history(&mut self, snapshot: RenderSnapshot) {
         self.history.push(snapshot);
+        self.trim_history(MAX_HISTORY_BYTES);
         if self.follow_latest || self.history_index < 0 {
             self.history_index = self.history.len() as i32 - 1;
             self.preview = self.history[self.history_index as usize].image.clone();
@@ -428,6 +468,13 @@ impl AppState {
             })?;
             let path = out_dir.join("xbrdf_current_atlas.exr");
             self.preview.save_exr(&path)?;
+            let metadata_path = out_dir.join("xbrdf_current_atlas.toml");
+            let metadata = self
+                .preview
+                .meta
+                .to_atlas_metadata(self.preview.width, self.preview.height);
+            std::fs::write(&metadata_path, toml::to_string_pretty(&metadata)?)
+                .with_context(|| format!("failed to write {}", metadata_path.display()))?;
             Ok(path)
         })();
 
@@ -442,8 +489,26 @@ impl AppState {
     }
 
     fn load_current_atlas(&mut self) {
-        let path = PathBuf::from(self.settings.out_dir.trim()).join("xbrdf_current_atlas.exr");
-        let result = PreviewImage::load_exr(&path, PreviewMeta::from_settings(&self.settings));
+        let out_dir = PathBuf::from(self.settings.out_dir.trim());
+        let path = out_dir.join("xbrdf_current_atlas.exr");
+        let metadata_path = out_dir.join("xbrdf_current_atlas.toml");
+        let result = (|| -> Result<PreviewImage> {
+            let text = std::fs::read_to_string(&metadata_path)
+                .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+            let metadata: AtlasMetadata = toml::from_str(&text)
+                .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+            let image = PreviewImage::load_exr(&path, PreviewMeta::from_atlas_metadata(metadata))?;
+            if !metadata.dimensions_match(image.width, image.height) {
+                anyhow::bail!(
+                    "atlas dimensions {}x{} do not match metadata {}x{}",
+                    image.width,
+                    image.height,
+                    metadata.atlas_width,
+                    metadata.atlas_height
+                );
+            }
+            Ok(image)
+        })();
 
         match result {
             Ok(image) => {
@@ -479,6 +544,8 @@ enum BakeEvent {
     Started {
         width: u32,
         height: u32,
+        meta: PreviewMeta,
+        total_work: u32,
     },
     Frame(ProgressiveFrame),
     AtlasFrame(AtlasProgressFrame),
@@ -493,153 +560,6 @@ enum BakeEvent {
 struct RenderSnapshot {
     image: PreviewImage,
     label: String,
-}
-
-#[derive(Clone, Default)]
-struct PreviewImage {
-    width: u32,
-    height: u32,
-    rgb: Vec<[f32; 3]>,
-    rgba: Vec<u8>,
-    exposure: f32,
-    meta: PreviewMeta,
-}
-
-impl PreviewImage {
-    fn new(width: u32, height: u32, meta: PreviewMeta) -> Self {
-        Self {
-            width,
-            height,
-            rgb: vec![[0.0; 3]; width as usize * height as usize],
-            rgba: vec![0; width as usize * height as usize * 4],
-            exposure: 0.0,
-            meta,
-        }
-    }
-
-    fn from_frame(frame: &ProgressiveFrame, meta: PreviewMeta) -> Self {
-        let mut image = Self::new(frame.width, frame.height, meta);
-        image.write_frame(frame);
-        image
-    }
-
-    fn from_atlas_frame(frame: &AtlasProgressFrame, meta: PreviewMeta) -> Self {
-        let mut image = Self::new(frame.width, frame.height, meta);
-        image.write_pixels(&frame.pixels);
-        image
-    }
-
-    fn write_frame(&mut self, frame: &ProgressiveFrame) {
-        if self.width != frame.width || self.height != frame.height || self.height == 0 {
-            return;
-        }
-
-        self.write_pixels(&frame.pixels);
-    }
-
-    fn write_pixels(&mut self, pixels: &[[f32; 3]]) {
-        if self.width == 0 || self.height == 0 {
-            return;
-        }
-
-        let gain = 2.0_f32.powf(self.exposure);
-        for (index, src) in pixels.iter().enumerate() {
-            if index * 4 + 3 >= self.rgba.len() {
-                break;
-            }
-            if index < self.rgb.len() {
-                self.rgb[index] = *src;
-            }
-            let dst = index * 4;
-            self.rgba[dst] = to_preview_byte(src[0] * gain);
-            self.rgba[dst + 1] = to_preview_byte(src[1] * gain);
-            self.rgba[dst + 2] = to_preview_byte(src[2] * gain);
-            self.rgba[dst + 3] = 255;
-        }
-    }
-
-    fn save_exr(&self, path: &Path) -> Result<()> {
-        if self.width == 0 || self.height == 0 || self.rgb.is_empty() {
-            anyhow::bail!("no atlas is selected");
-        }
-
-        write_rgb_file(path, self.width as usize, self.height as usize, |x, y| {
-            let pixel = self.rgb[y * self.width as usize + x];
-            (pixel[0], pixel[1], pixel[2])
-        })
-        .with_context(|| format!("failed to write EXR {}", path.display()))
-    }
-
-    fn load_exr(path: &Path, meta: PreviewMeta) -> Result<Self> {
-        let image = read_first_rgba_layer_from_file(
-            path,
-            |resolution, _channels| {
-                (
-                    resolution.0 as u32,
-                    resolution.1 as u32,
-                    vec![[0.0_f32; 3]; resolution.0 * resolution.1],
-                )
-            },
-            |pixels, position, (r, g, b, _a): (f32, f32, f32, f32)| {
-                let width = pixels.0 as usize;
-                pixels.2[position.1 * width + position.0] = [r, g, b];
-            },
-        )
-        .with_context(|| format!("failed to read EXR {}", path.display()))?;
-
-        let (width, height, rgb) = image.layer_data.channel_data.pixels;
-        let mut preview = Self::new(width, height, meta);
-        preview.write_pixels(&rgb);
-        Ok(preview)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PreviewMeta {
-    mode: BakeMode,
-    camera_width: u32,
-    camera_height: u32,
-    light_width: u32,
-    light_height: u32,
-}
-
-impl Default for PreviewMeta {
-    fn default() -> Self {
-        Self {
-            mode: BakeMode::Single,
-            camera_width: 1,
-            camera_height: 1,
-            light_width: 1,
-            light_height: 1,
-        }
-    }
-}
-
-impl PreviewMeta {
-    fn from_settings(settings: &BakeSettings) -> Self {
-        let (_, _, tile_width, tile_height, _) = preview_extents(settings);
-        Self {
-            mode: settings.bake_mode(),
-            camera_width: tile_width.max(1),
-            camera_height: tile_height.max(1),
-            light_width: match settings.bake_mode() {
-                BakeMode::Single => 1,
-                BakeMode::Full | BakeMode::Isotropic => settings.light_width.max(1) as u32,
-            },
-            light_height: match settings.bake_mode() {
-                BakeMode::Single => 1,
-                BakeMode::Full | BakeMode::Isotropic => settings.light_height.max(1) as u32,
-            },
-        }
-    }
-
-    fn mode_code(self) -> i32 {
-        match self.mode {
-            BakeMode::Single => 0,
-            BakeMode::Full => 1,
-            BakeMode::Isotropic => 2,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -880,178 +800,8 @@ impl PreviewModelOption {
     }
 }
 
-const MODEL_VERTEX_SHADER: &str = r#"
-#version 330 core
-in vec3 position;
-in vec3 normal;
-in vec3 tangent;
-in vec3 bitangent;
-
-uniform mat4 model;
-uniform mat4 view;
-uniform mat4 projection;
-
-out vec3 v_position;
-out vec3 v_normal;
-out vec3 v_tangent;
-out vec3 v_bitangent;
-
-void main() {
-    vec4 world = model * vec4(position, 1.0);
-    mat3 basis = mat3(model);
-    v_position = world.xyz;
-    v_normal = normalize(basis * normal);
-    v_tangent = normalize(basis * tangent);
-    v_bitangent = normalize(basis * bitangent);
-    gl_Position = projection * view * world;
-}
-"#;
-
-const MODEL_FRAGMENT_SHADER: &str = r#"
-#version 330 core
-const float PI = 3.14159265358979323846;
-const float TAU = 6.28318530717958647692;
-const float HALF_PI = 1.57079632679489661923;
-
-in vec3 v_position;
-in vec3 v_normal;
-in vec3 v_tangent;
-in vec3 v_bitangent;
-
-uniform sampler2D xbrdf_tex;
-uniform vec3 camera_pos;
-uniform vec3 preview_light;
-uniform int mode;
-uniform int camera_width;
-uniform int camera_height;
-uniform int light_width;
-uniform int light_height;
-
-out vec4 color;
-
-vec2 dir_to_latlong(vec3 dir) {
-    dir = normalize(dir);
-    float u = atan(dir.x, dir.z) / TAU + 0.5;
-    float v = 1.0 - asin(clamp(dir.y, 0.0, 1.0)) / HALF_PI;
-    return vec2(fract(u), clamp(v, 0.0, 1.0));
-}
-
-vec4 fetch_atlas(ivec2 p) {
-    ivec2 size = textureSize(xbrdf_tex, 0);
-    p.x = ((p.x % size.x) + size.x) % size.x;
-    p.y = clamp(p.y, 0, size.y - 1);
-    return texelFetch(xbrdf_tex, p, 0);
-}
-
-vec4 sample_camera_tile(int light_x, int light_y, vec2 camera_uv) {
-    float fx = camera_uv.x * float(camera_width) - 0.5;
-    float fy = camera_uv.y * float(camera_height) - 0.5;
-    int x0 = int(floor(fx));
-    int y0 = int(floor(fy));
-    float tx = fract(fx);
-    float ty = fract(fy);
-    int x1 = x0 + 1;
-    int y1 = y0 + 1;
-    int wx0 = ((x0 % camera_width) + camera_width) % camera_width;
-    int wx1 = ((x1 % camera_width) + camera_width) % camera_width;
-    y0 = clamp(y0, 0, camera_height - 1);
-    y1 = clamp(y1, 0, camera_height - 1);
-
-    ivec2 base = ivec2(light_x * camera_width, light_y * camera_height);
-    vec4 a = fetch_atlas(base + ivec2(wx0, y0));
-    vec4 b = fetch_atlas(base + ivec2(wx1, y0));
-    vec4 c = fetch_atlas(base + ivec2(wx0, y1));
-    vec4 d = fetch_atlas(base + ivec2(wx1, y1));
-    return mix(mix(a, b, tx), mix(c, d, tx), ty);
-}
-
-vec4 sample_iso_tile(int light_x, int light_y, float camera_v) {
-    float fy = camera_v * float(camera_height) - 0.5;
-    int y0 = clamp(int(floor(fy)), 0, camera_height - 1);
-    int y1 = clamp(y0 + 1, 0, camera_height - 1);
-    float ty = fract(fy);
-    int x = ((light_x % light_width) + light_width) % light_width;
-    int base_y = light_y * camera_height;
-    return mix(fetch_atlas(ivec2(x, base_y + y0)), fetch_atlas(ivec2(x, base_y + y1)), ty);
-}
-
-vec4 sample_light_grid(vec3 light_dir, vec2 camera_uv, bool isotropic) {
-    vec2 light_uv = dir_to_latlong(light_dir);
-    float gx = light_uv.x * float(light_width) - 0.5;
-    float gy = light_uv.y * float(light_height) - 0.5;
-    int x0 = int(floor(gx));
-    int y0 = int(floor(gy));
-    float tx = fract(gx);
-    float ty = fract(gy);
-    int x1 = x0 + 1;
-    int y1 = y0 + 1;
-    x0 = ((x0 % light_width) + light_width) % light_width;
-    x1 = ((x1 % light_width) + light_width) % light_width;
-    y0 = clamp(y0, 0, light_height - 1);
-    y1 = clamp(y1, 0, light_height - 1);
-
-    vec4 a = isotropic ? sample_iso_tile(x0, y0, camera_uv.y) : sample_camera_tile(x0, y0, camera_uv);
-    vec4 b = isotropic ? sample_iso_tile(x1, y0, camera_uv.y) : sample_camera_tile(x1, y0, camera_uv);
-    vec4 c = isotropic ? sample_iso_tile(x0, y1, camera_uv.y) : sample_camera_tile(x0, y1, camera_uv);
-    vec4 d = isotropic ? sample_iso_tile(x1, y1, camera_uv.y) : sample_camera_tile(x1, y1, camera_uv);
-    return mix(mix(a, b, tx), mix(c, d, tx), ty);
-}
-
-vec3 stable_perpendicular(vec3 n) {
-    vec3 helper = abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    return normalize(cross(helper, n));
-}
-
-void main() {
-    vec3 n = normalize(v_normal);
-    vec3 t = normalize(v_tangent);
-    vec3 b = normalize(v_bitangent);
-    vec3 wo_world = normalize(camera_pos - v_position);
-    vec3 wi_world = normalize(preview_light);
-
-    if (mode == 2) {
-        float wo_y = dot(wo_world, n);
-        float wi_y = dot(wi_world, n);
-        if (wo_y <= 0.0 || wi_y <= 0.0) {
-            color = vec4(0.015, 0.015, 0.017, 1.0);
-            return;
-        }
-
-        vec3 view_projected = wo_world - n * wo_y;
-        vec3 iso_z = dot(view_projected, view_projected) > 1.0e-8
-            ? normalize(view_projected)
-            : stable_perpendicular(n);
-        vec3 iso_x = normalize(cross(iso_z, n));
-        vec3 wi = normalize(vec3(dot(wi_world, iso_x), wi_y, dot(wi_world, iso_z)));
-
-        vec2 camera_uv = vec2(0.5, 1.0 - asin(clamp(wo_y, 0.0, 1.0)) / HALF_PI);
-        vec4 response = sample_light_grid(wi, camera_uv, true);
-        float rim = 0.08 * pow(1.0 - max(dot(n, wo_world), 0.0), 2.0);
-        color = vec4(response.rgb * max(wi_y, 0.0) + vec3(rim), 1.0);
-        return;
-    }
-
-    vec3 wo = normalize(vec3(dot(wo_world, t), dot(wo_world, n), dot(wo_world, b)));
-    vec3 wi = normalize(vec3(dot(wi_world, t), dot(wi_world, n), dot(wi_world, b)));
-
-    if (wo.y <= 0.0 || wi.y <= 0.0) {
-        color = vec4(0.015, 0.015, 0.017, 1.0);
-        return;
-    }
-
-    vec2 camera_uv = dir_to_latlong(wo);
-    vec4 response;
-    if (mode == 1) {
-        response = sample_light_grid(wi, camera_uv, false);
-    } else {
-        response = sample_camera_tile(0, 0, camera_uv);
-    }
-
-    float macro_cosine = max(wi.y, 0.0);
-    float rim = 0.08 * pow(1.0 - max(dot(n, wo_world), 0.0), 2.0);
-    color = vec4(response.rgb * macro_cosine + vec3(rim), 1.0);
-}
-"#;
+const MODEL_VERTEX_SHADER: &str = include_str!("model.vert");
+const MODEL_FRAGMENT_SHADER: &str = include_str!("model.frag");
 
 fn draw_ui(
     ui: &Ui,
@@ -1109,8 +859,7 @@ fn draw_ui(
             let (atlas_width, atlas_height, tile_width, tile_height, light_count) =
                 preview_extents(&app.settings);
             ui.text(format!(
-                "Output {}x{}; tile {}x{}; {} light directions",
-                atlas_width, atlas_height, tile_width, tile_height, light_count
+                "Output {atlas_width}x{atlas_height}; tile {tile_width}x{tile_height}; {light_count} light directions"
             ));
 
             ui.input_float3("Light", &mut app.settings.light).build();
@@ -1142,7 +891,9 @@ fn draw_ui(
 
             ui.separator();
             if app.baking {
-                ui.text("Bake in progress");
+                if ui.button("Cancel Bake") {
+                    app.cancel_bake();
+                }
             } else if ui.button("Start Bake") {
                 app.start_bake();
             }
@@ -1162,6 +913,12 @@ fn draw_ui(
                     format_duration(stats.gpu_dispatch_time),
                     rays_per_second(stats)
                 ));
+                if let Some(gpu_time) = stats.gpu_timestamp_time {
+                    ui.text(format!(
+                        "GPU timestamp {} compute time",
+                        format_duration(gpu_time)
+                    ));
+                }
             }
             if ui.button("Save Current Atlas") {
                 app.save_current_atlas();
@@ -1310,7 +1067,7 @@ fn draw_history_ticks(
     let usable_width = (slider_max[0] - slider_min[0]).max(1.0);
     let y0 = slider_max[1] + 2.0;
     let max_ticks = 96usize;
-    let step = ((count + max_ticks - 1) / max_ticks).max(1);
+    let step = count.div_ceil(max_ticks).max(1);
 
     for index in (0..count).step_by(step) {
         let t = if count > 1 {
@@ -1334,7 +1091,7 @@ fn draw_history_ticks(
     }
 }
 
-fn run_bake<F>(settings: BakeSettings, mut send: F) -> Result<()>
+fn run_bake<F>(settings: BakeSettings, control: BakeControl, mut send: F) -> Result<()>
 where
     F: FnMut(BakeEvent),
 {
@@ -1355,10 +1112,16 @@ where
     send(BakeEvent::Started {
         width: config.atlas_width(),
         height: config.atlas_height(),
+        meta: PreviewMeta::from_config(&config),
+        total_work: if config.mode == BakeMode::Single {
+            config.samples
+        } else {
+            config.light_count()
+        },
     });
 
     let result = if config.light_count() == 1 && config.mode == BakeMode::Single {
-        pollster::block_on(xbrdf_gpu::bake_progressive(
+        pollster::block_on(xbrdf_gpu::bake_progressive_with_control(
             &config,
             &mesh,
             ProgressiveBakeOptions {
@@ -1366,6 +1129,7 @@ where
                     settings.update_interval_seconds.max(0.05),
                 ),
             },
+            &control,
             |frame| {
                 send(BakeEvent::Frame(frame));
             },
@@ -1373,9 +1137,10 @@ where
         .context("GPU bake failed")?
     } else {
         send(BakeEvent::Status("Baking atlas".to_string()));
-        let result = pollster::block_on(xbrdf_gpu::bake_atlas_with_progress(
+        let result = pollster::block_on(xbrdf_gpu::bake_atlas_with_control(
             &config,
             &mesh,
+            &control,
             |frame| {
                 send(BakeEvent::AtlasFrame(frame));
             },
@@ -1397,7 +1162,7 @@ where
     )
     .with_context(|| format!("failed to write EXR {}", image_path.display()))?;
 
-    let manifest = Manifest::new(&config, &mesh);
+    let manifest = Manifest::new(&config, &mesh).context("failed to hash input geometry")?;
     let manifest_path = out_dir.join("manifest.toml");
     let manifest_text = toml::to_string_pretty(&manifest).context("failed to encode manifest")?;
     std::fs::write(&manifest_path, manifest_text)
@@ -1561,7 +1326,7 @@ fn load_preview_fbx(path: &Path) -> Result<(Vec<ModelVertex>, Vec<u32>)> {
     let mut indices = Vec::new();
 
     for geometry in fbx.children.iter().flat_map(geometry_nodes) {
-        parse_preview_fbx_geometry(geometry, &mut vertices, &mut indices);
+        parse_preview_fbx_geometry(geometry, &mut vertices, &mut indices)?;
     }
 
     if vertices.is_empty() || indices.is_empty() {
@@ -1577,37 +1342,40 @@ fn parse_preview_fbx_geometry(
     node: &Node,
     vertices_out: &mut Vec<ModelVertex>,
     indices_out: &mut Vec<u32>,
-) {
+) -> Result<()> {
     let Some(raw_vertices) = child_f64_array(node, "Vertices") else {
-        return;
+        return Ok(());
     };
     let Some(polygon_indices) = child_i32_array(node, "PolygonVertexIndex") else {
-        return;
+        return Ok(());
     };
+    if raw_vertices.len() % 3 != 0 {
+        anyhow::bail!("FBX vertex array length is not divisible by three");
+    }
     let positions: Vec<_> = raw_vertices
         .chunks_exact(3)
         .map(|chunk| Vec3::new(chunk[0] as f32, chunk[1] as f32, chunk[2] as f32))
         .collect();
+    if positions.iter().any(|position| !position.is_finite()) {
+        anyhow::bail!("FBX contains a non-finite position");
+    }
     let uv_layer = fbx_uv_layer(node);
     let mut polygon = Vec::new();
     let mut polygon_vertex_start = 0usize;
 
     for raw_index in polygon_indices {
-        let end = raw_index < 0;
-        let vertex_index = if end {
-            (-raw_index - 1) as usize
-        } else {
-            raw_index as usize
-        };
+        let (vertex_index, end) =
+            decode_polygon_index(raw_index).context("FBX contains an invalid polygon index")?;
+        if vertex_index >= positions.len() {
+            anyhow::bail!("FBX polygon index is out of range");
+        }
         polygon.push(vertex_index);
 
         if end {
             if polygon.len() >= 3 {
                 for local in 1..polygon.len() - 1 {
                     let tri_indices = [polygon[0], polygon[local], polygon[local + 1]];
-                    if tri_indices.iter().any(|index| *index >= positions.len()) {
-                        continue;
-                    }
+                    debug_assert!(tri_indices.iter().all(|index| *index < positions.len()));
                     let tri_uvs = uv_layer.as_ref().map(|layer| {
                         [
                             layer.uv_at(polygon_vertex_start, &polygon, 0),
@@ -1631,6 +1399,7 @@ fn parse_preview_fbx_geometry(
             polygon.clear();
         }
     }
+    Ok(())
 }
 
 fn push_preview_triangle(
@@ -1833,148 +1602,6 @@ fn fbx_uv_layer(node: &Node) -> Option<FbxUvLayer> {
     })
 }
 
-fn geometry_nodes<'a>(node: &'a Node) -> Vec<&'a Node> {
-    let mut nodes = Vec::new();
-    collect_geometry_nodes(node, &mut nodes);
-    nodes
-}
-
-fn collect_geometry_nodes<'a>(node: &'a Node, nodes: &mut Vec<&'a Node>) {
-    if node.name == "Geometry" {
-        nodes.push(node);
-    }
-    for child in &node.children {
-        collect_geometry_nodes(child, nodes);
-    }
-}
-
-fn child_f64_array(node: &Node, name: &str) -> Option<Vec<f64>> {
-    node.children
-        .iter()
-        .find(|child| child.name == name)
-        .and_then(|child| match child.properties.first()? {
-            Property::F64Array(values) => Some(values.clone()),
-            Property::F32Array(values) => Some(values.iter().map(|value| *value as f64).collect()),
-            _ => None,
-        })
-}
-
-fn child_i32_array(node: &Node, name: &str) -> Option<Vec<i32>> {
-    node.children
-        .iter()
-        .find(|child| child.name == name)
-        .and_then(|child| match child.properties.first()? {
-            Property::I32Array(values) => Some(values.clone()),
-            _ => None,
-        })
-}
-
-fn child_string(node: &Node, name: &str) -> Option<String> {
-    node.children
-        .iter()
-        .find(|child| child.name == name)
-        .and_then(|child| match child.properties.first()? {
-            Property::String(value) => Some(value.clone()),
-            _ => None,
-        })
-}
-
-fn quat_from_axis_angle(axis: [f32; 3], angle: f32) -> [f32; 4] {
-    let axis = normalize3(axis);
-    let half = angle * 0.5;
-    let (s, c) = half.sin_cos();
-    [axis[0] * s, axis[1] * s, axis[2] * s, c]
-}
-
-fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    [
-        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-    ]
-}
-
-fn normalize_quat(q: [f32; 4]) -> [f32; 4] {
-    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    if len > 1.0e-6 && len.is_finite() {
-        [q[0] / len, q[1] / len, q[2] / len, q[3] / len]
-    } else {
-        [0.0, 0.0, 0.0, 1.0]
-    }
-}
-
-fn quat_to_mat4(q: [f32; 4]) -> [[f32; 4]; 4] {
-    let q = normalize_quat(q);
-    let x = q[0];
-    let y = q[1];
-    let z = q[2];
-    let w = q[3];
-    let xx = x * x;
-    let yy = y * y;
-    let zz = z * z;
-    let xy = x * y;
-    let xz = x * z;
-    let yz = y * z;
-    let wx = w * x;
-    let wy = w * y;
-    let wz = w * z;
-
-    [
-        [1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy), 0.0],
-        [2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx), 0.0],
-        [2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy), 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (0.5 * fov_y).tan();
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) / (near - far), -1.0],
-        [0.0, 0.0, (2.0 * far * near) / (near - far), 0.0],
-    ]
-}
-
-fn look_at(eye: [f32; 3], center: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
-    let f = normalize3(sub3(center, eye));
-    let s = normalize3(cross3(f, up));
-    let u = cross3(s, f);
-    [
-        [s[0], u[0], -f[0], 0.0],
-        [s[1], u[1], -f[1], 0.0],
-        [s[2], u[2], -f[2], 0.0],
-        [-dot3(s, eye), -dot3(u, eye), dot3(f, eye), 1.0],
-    ]
-}
-
-fn normalize3(value: [f32; 3]) -> [f32; 3] {
-    let len = dot3(value, value).sqrt();
-    if len > 1.0e-6 && len.is_finite() {
-        [value[0] / len, value[1] / len, value[2] / len]
-    } else {
-        [0.0, 1.0, 0.0]
-    }
-}
-
-fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
 fn load_config_into_settings(settings: &mut BakeSettings) -> Result<()> {
     let path = trimmed_path(&settings.config_path).context("config path is empty")?;
     let config = BakeConfigFile::read(&path)
@@ -2086,18 +1713,17 @@ fn resolve_gui_override_path(path: PathBuf) -> PathBuf {
     }
 }
 
-fn path_to_gui_string(path: &PathBuf) -> String {
+fn path_to_gui_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn to_preview_byte(value: f32) -> u8 {
-    let value = value.max(0.0).powf(1.0 / 2.2).clamp(0.0, 1.0);
-    (value * 255.0 + 0.5) as u8
-}
-
 fn rays_per_second(stats: &GpuBakeStats) -> f64 {
-    if stats.gpu_dispatch_time.as_secs_f64() > 0.0 {
-        stats.camera_ray_count as f64 / stats.gpu_dispatch_time.as_secs_f64()
+    let elapsed = stats
+        .gpu_timestamp_time
+        .unwrap_or(stats.gpu_dispatch_time)
+        .as_secs_f64();
+    if elapsed > 0.0 {
+        stats.camera_ray_count as f64 / elapsed
     } else {
         0.0
     }
@@ -2118,14 +1744,32 @@ mod tests {
 
     #[test]
     fn preview_pig_fbx_loads_when_present() {
-        let path = Path::new("assets/preview/pig.fbx");
-        if !path.exists() {
-            return;
-        }
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let path = workspace.join("assets/preview/pig.fbx");
+        assert!(path.exists(), "missing preview fixture {}", path.display());
 
-        let (vertices, indices) = load_preview_fbx(path).unwrap();
+        let (vertices, indices) = load_preview_fbx(&path).unwrap();
         assert!(!vertices.is_empty());
         assert!(!indices.is_empty());
         assert_eq!(indices.len() % 3, 0);
+    }
+
+    #[test]
+    fn history_evicts_oldest_images_to_fit_budget() {
+        let mut app = AppState::default();
+        for label in ["first", "second", "third"] {
+            app.history.push(RenderSnapshot {
+                image: PreviewImage::new(2, 2, PreviewMeta::default()),
+                label: label.to_string(),
+            });
+        }
+        let one_image_bytes = app.history[0].image.rgb.len() * std::mem::size_of::<[f32; 3]>()
+            + app.history[0].image.rgba.len();
+        app.trim_history(one_image_bytes);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].label, "third");
     }
 }
